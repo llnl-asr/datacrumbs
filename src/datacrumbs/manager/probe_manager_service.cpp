@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #include "datacrumbs/manager/probe_manager_service.h"
 
 #include <arpa/inet.h>
@@ -310,6 +313,7 @@ ProbeManagerService::~ProbeManagerService() {
 }
 
 int ProbeManagerService::run() {
+  // Step 1/3: Initialize process-level safety and secret material.
   signal(SIGPIPE, SIG_IGN);
 
   std::string secret;
@@ -318,12 +322,14 @@ int ProbeManagerService::run() {
     return 1;
   }
 
+  // Step 2/3: Initialize the listening socket.
   if (!initialize_socket()) {
     return 1;
   }
 
   DC_LOG_INFO("Datacrumbs probe manager service listening on %s:%d", host_.c_str(), port_);
 
+  // Step 3/3: Accept and process client requests serially.
   for (;;) {
     const int client_fd = accept(server_fd_, nullptr, nullptr);
     if (client_fd < 0) {
@@ -393,6 +399,7 @@ bool ProbeManagerService::initialize_socket() {
 }
 
 void ProbeManagerService::handle_client(int client_fd) const {
+  // Step 1/3: Read and parse the incoming JSON-RPC request.
   std::string request_payload;
   std::string request_id;
 
@@ -412,6 +419,7 @@ void ProbeManagerService::handle_client(int client_fd) const {
     return;
   }
 
+  // Step 2/3: Validate RPC envelope fields and locate params.
   const std::string version = json_string_or_empty(request_root, "jsonrpc");
   request_id = json_string_or_empty(request_root, "id");
   const std::string method = json_string_or_empty(request_root, "method");
@@ -431,6 +439,7 @@ void ProbeManagerService::handle_client(int client_fd) const {
     return;
   }
 
+  // Step 3/3: Dispatch to method-specific request handlers.
   if (method == kSignMethod) {
     json_object* signing_payload_obj = nullptr;
     if (!json_object_object_get_ex(params, "signing_payload", &signing_payload_obj) ||
@@ -586,6 +595,7 @@ bool ProbeManagerService::report_runtime_probe_state(const std::string& state_pa
 
 bool ProbeManagerService::validate_signing_payload(const std::string& signing_payload,
                                                    std::vector<std::string>* errors) const {
+  // Step 1/4: Parse the root object and validate top-level required keys.
   json_object* root = json_tokener_parse(signing_payload.c_str());
   if (root == nullptr || json_object_get_type(root) != json_type_object) {
     if (errors != nullptr) {
@@ -602,6 +612,7 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
                            errors) &&
        ok;
 
+  // Step 2/4: Validate checksum algorithm and summary metadata contract.
   json_object* checksum_algorithm_obj = nullptr;
   if (!json_object_object_get_ex(root, "checksum_algorithm", &checksum_algorithm_obj) ||
       json_object_get_type(checksum_algorithm_obj) != json_type_string ||
@@ -644,6 +655,7 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
     requesting_user = json_string_or_empty(summary, "user");
   }
 
+  // Step 3/4: Validate each category/probe entry and function list constraints.
   json_object* categories = nullptr;
   if (!json_object_object_get_ex(root, "categories", &categories) ||
       json_object_get_type(categories) != json_type_array) {
@@ -806,12 +818,14 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
     }
   }
 
+  // Step 4/4: Release parsed JSON resources and return aggregate result.
   json_object_put(root);
   return ok;
 }
 
 bool ProbeManagerService::persist_runtime_probe_state_payload(const std::string& state_payload,
                                                               std::string* error) const {
+  // Step 1/6: Parse and validate required runtime state payload fields.
   json_object* root = json_tokener_parse(state_payload.c_str());
   if (root == nullptr || json_object_get_type(root) != json_type_object) {
     if (root != nullptr) {
@@ -854,6 +868,7 @@ bool ProbeManagerService::persist_runtime_probe_state_payload(const std::string&
     return false;
   }
 
+  // Step 2/6: Open/create sqlite database used for runtime state persistence.
   sqlite3* db = nullptr;
   if (sqlite3_open_v2(database_path.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
                       nullptr) != SQLITE_OK) {
@@ -868,6 +883,7 @@ bool ProbeManagerService::persist_runtime_probe_state_payload(const std::string&
     return false;
   }
 
+  // Step 3/6: Ensure schema exists and start a write transaction.
   sqlite3_busy_timeout(db, 5000);
   if (!sqlite_exec(db,
                    "CREATE TABLE IF NOT EXISTS runtime_probe_status_by_node ("
@@ -885,6 +901,7 @@ bool ProbeManagerService::persist_runtime_probe_state_payload(const std::string&
     return false;
   }
 
+  // Step 4/6: Prepare reusable insert/delete statements.
   sqlite3_stmt* insert_stmt = nullptr;
   sqlite3_stmt* delete_invalid_stmt = nullptr;
   const char* insert_sql =
@@ -911,6 +928,7 @@ bool ProbeManagerService::persist_runtime_probe_state_payload(const std::string&
     return false;
   }
 
+  // Step 5/6: Persist successful/invalid entry arrays with invalid cleanup semantics.
   auto persist_entries = [&](json_object* entries, const char* status) -> bool {
     const int count = json_object_array_length(entries);
     for (int i = 0; i < count; ++i) {
@@ -967,6 +985,7 @@ bool ProbeManagerService::persist_runtime_probe_state_payload(const std::string&
     return true;
   };
 
+  // Step 6/6: Finalize statements, commit/rollback transaction, and cleanup resources.
   const bool persisted_successful = persist_entries(successful_entries_obj, "successful");
   const bool persisted_invalid =
       persisted_successful && persist_entries(invalid_entries_obj, "invalid");

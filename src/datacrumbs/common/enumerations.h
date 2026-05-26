@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #ifndef DATACRUMBS_COMMON_ENUMERATIONS_H__
 #define DATACRUMBS_COMMON_ENUMERATIONS_H__
 
@@ -12,14 +15,21 @@
 
 namespace datacrumbs {
 
-// Enum for different operating modes
+/**
+ * @brief Runtime operating mode.
+ */
 enum class Mode : uint8_t {
   PROFILER = 0,
   TRACER = 1,
 };
 
-// Converts string to Mode enum. Throws if invalid.
-// DC_LOG_TRACE can be used to trace function entry/exit.
+/**
+ * @brief Convert mode string to enum value.
+ * @param s Mode string.
+ *        Example: "profiler" or "tracer".
+ * @param type Output enum value.
+ * @throws std::invalid_argument for unknown mode string.
+ */
 inline void convert(const std::string& s, Mode& type) {
   DC_LOG_TRACE("Entering convert for Mode with input: %s", s.c_str());
   if (s == "profiler") {
@@ -35,7 +45,9 @@ inline void convert(const std::string& s, Mode& type) {
   DC_LOG_TRACE("Exiting convert for Mode");
 }
 
-// Enum for different probe types
+/**
+ * @brief Probe types supported by datacrumbs runtime.
+ */
 enum class ProbeType : uint8_t {
   SYSCALLS = 0,
   KPROBE = 1,
@@ -44,7 +56,13 @@ enum class ProbeType : uint8_t {
   CUSTOM = 4,
 };
 
-// Converts string to ProbeType enum. Throws if invalid.
+/**
+ * @brief Convert probe type string to enum.
+ * @param s Probe type string.
+ *        Example: "syscalls", "kprobe", "uprobe", "usdt", "custom".
+ * @param type Output enum value.
+ * @throws std::invalid_argument for unknown probe type.
+ */
 inline void convert(const std::string& s, ProbeType& type) {
   DC_LOG_TRACE("Entering convert for ProbeType with input: %s", s.c_str());
   if (s == "syscalls") {
@@ -70,7 +88,9 @@ inline void convert(const std::string& s, ProbeType& type) {
   DC_LOG_TRACE("Exiting convert for ProbeType");
 }
 
-// Enum for different capture types
+/**
+ * @brief Capture-source types used by probe explorer.
+ */
 enum class CaptureType : uint8_t {
   HEADER = 0,
   BINARY = 1,
@@ -79,7 +99,13 @@ enum class CaptureType : uint8_t {
   CUSTOM = 4,  // Custom capture type for user-defined probes
 };
 
-// Converts string to CaptureType enum. Throws if invalid.
+/**
+ * @brief Convert capture type string to enum.
+ * @param s Capture type string.
+ *        Example: "header", "binary", "ksym", "usdt", "custom".
+ * @param type Output enum value.
+ * @throws std::invalid_argument for unknown capture type.
+ */
 inline void convert(const std::string& s, CaptureType& type) {
   DC_LOG_TRACE("Entering convert for CaptureType with input: %s", s.c_str());
   if (s == "header") {

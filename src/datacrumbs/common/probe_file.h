@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #ifndef DATACRUMBS_COMMON_PROBE_FILE_H__
 #define DATACRUMBS_COMMON_PROBE_FILE_H__
 
@@ -20,10 +23,20 @@
 
 namespace datacrumbs::probe_file {
 
+/**
+ * @brief Probe secret file path used for HMAC signing and verification.
+ * @return Filesystem path to the probe secret.
+ */
 inline std::filesystem::path secret_path() {
   return DATACRUMBS_PROBE_SECRET_FILE;
 }
 
+/**
+ * @brief Convert bytes to lowercase hex string.
+ * @param data Input byte buffer.
+ * @param size Number of bytes.
+ * @return Hex representation.
+ */
 inline std::string bytes_to_hex(const unsigned char* data, std::size_t size) {
   std::ostringstream oss;
   oss << std::hex << std::setfill('0');
@@ -33,6 +46,11 @@ inline std::string bytes_to_hex(const unsigned char* data, std::size_t size) {
   return oss.str();
 }
 
+/**
+ * @brief Read text file content.
+ * @param path File path.
+ * @return File content, or empty string on open failure.
+ */
 inline std::string read_text_file(const std::filesystem::path& path) {
   std::ifstream input(path);
   if (!input.is_open()) {
@@ -41,6 +59,11 @@ inline std::string read_text_file(const std::filesystem::path& path) {
   return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
 }
 
+/**
+ * @brief Read probe payload from plain or gzip-compressed file.
+ * @param path Probe file path.
+ * @return Decoded payload text, or empty string on failure.
+ */
 inline std::string read_probe_payload(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
   if (!input.is_open()) {
@@ -71,6 +94,12 @@ inline std::string read_probe_payload(const std::filesystem::path& path) {
   return payload;
 }
 
+/**
+ * @brief Write a file with owner-only permissions.
+ * @param path Destination path.
+ * @param content File content.
+ * @return True if write and permission updates succeed.
+ */
 inline bool write_owner_only_file(const std::filesystem::path& path, const std::string& content) {
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
@@ -90,6 +119,12 @@ inline bool write_owner_only_file(const std::filesystem::path& path, const std::
   return written == static_cast<ssize_t>(content.size()) && chown_ok && chmod_ok && close_ok;
 }
 
+/**
+ * @brief Write gzip-compressed file content.
+ * @param path Destination path.
+ * @param payload Uncompressed payload text.
+ * @return True on successful gzip write.
+ */
 inline bool write_gzip_file(const std::filesystem::path& path, const std::string& payload) {
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
@@ -108,6 +143,11 @@ inline bool write_gzip_file(const std::filesystem::path& path, const std::string
   return written > 0 && close_status == Z_OK;
 }
 
+/**
+ * @brief Ensure probe secret exists and is owner-restricted.
+ * @param secret_out Optional output with loaded/generated secret.
+ * @return True when secret is available for signing.
+ */
 inline bool ensure_probe_secret(std::string* secret_out = nullptr) {
   const auto path = secret_path();
   std::string secret = read_text_file(path);
@@ -146,6 +186,12 @@ inline bool ensure_probe_secret(std::string* secret_out = nullptr) {
   return true;
 }
 
+/**
+ * @brief Compute HMAC SHA-256 in hex form.
+ * @param secret Shared signing secret.
+ * @param payload Payload to sign.
+ * @return Hex checksum, or empty string on HMAC failure.
+ */
 inline std::string hmac_sha256_hex(const std::string& secret, const std::string& payload) {
   unsigned char digest[EVP_MAX_MD_SIZE];
   unsigned int digest_len = 0;
@@ -157,11 +203,22 @@ inline std::string hmac_sha256_hex(const std::string& secret, const std::string&
   return bytes_to_hex(digest, digest_len);
 }
 
+/**
+ * @brief Serialize categories object for signing.
+ * @param categories JSON categories array/object.
+ * @return Compact JSON payload string.
+ */
 inline std::string categories_payload(json_object* categories) {
   const char* payload = json_object_to_json_string_ext(categories, JSON_C_TO_STRING_PLAIN);
   return payload != nullptr ? payload : "";
 }
 
+/**
+ * @brief Build canonical JSON payload for signature verification.
+ * @param summary Summary object.
+ * @param categories Categories object.
+ * @return Canonical compact JSON string.
+ */
 inline std::string signed_document_payload(json_object* summary, json_object* categories) {
   json_object* root = json_object_new_object();
   json_object_object_add(root, "summary", json_object_get(summary));
@@ -173,6 +230,13 @@ inline std::string signed_document_payload(json_object* summary, json_object* ca
   return result;
 }
 
+/**
+ * @brief Build signed categories document with checksum.
+ * @param categories Categories JSON array.
+ * @param summary_fields Summary key/value fields.
+ * @param secret HMAC secret.
+ * @return Newly created JSON document (caller owns ref).
+ */
 inline json_object* build_signed_categories_document(
     json_object* categories, const std::unordered_map<std::string, std::string>& summary_fields,
     const std::string& secret) {
@@ -192,6 +256,13 @@ inline json_object* build_signed_categories_document(
   return root;
 }
 
+/**
+ * @brief Validate signed root document and extract categories.
+ * @param root Root JSON object.
+ * @param secret HMAC secret.
+ * @param error Optional error message on validation failure.
+ * @return Borrowed categories object reference on success, nullptr on failure.
+ */
 inline json_object* verified_categories_from_root(json_object* root, const std::string& secret,
                                                   std::string* error = nullptr) {
   if (root == nullptr || json_object_get_type(root) != json_type_object) {
@@ -249,6 +320,12 @@ inline json_object* verified_categories_from_root(json_object* root, const std::
   return json_object_get(categories);
 }
 
+/**
+ * @brief Load, verify, and return categories from signed probe file.
+ * @param path Probe file path.
+ * @param error Optional error detail.
+ * @return Categories JSON object on success, nullptr on failure.
+ */
 inline json_object* load_verified_categories_from_file(const std::filesystem::path& path,
                                                        std::string* error = nullptr) {
   std::string secret;

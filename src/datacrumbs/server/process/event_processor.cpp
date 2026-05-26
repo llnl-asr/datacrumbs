@@ -1,4 +1,7 @@
 
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #include <datacrumbs/server/process/event_processor.h>
 // other headers
 #include <datacrumbs/common/constants.h>
@@ -57,6 +60,7 @@ std::unique_ptr<DataCrumbsArgs> build_runtime_args(
     return nullptr;
   }
 
+  // Build named argument map using capture metadata so writer can serialize rich values.
   auto args = std::make_unique<DataCrumbsArgs>();
   const unsigned int arg_count =
       std::min<unsigned int>(event->arg_count, metadata->arg_specs.size());
@@ -100,6 +104,7 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
 #endif
   unsigned int pid = event->id;
 
+  // Skip empty identity payloads to avoid emitting malformed trace entries.
   if (pid == 0) {
     DC_LOG_DEBUG("handle_event: pid is 0, skipping event");
     return 0;
@@ -110,7 +115,7 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
     // Print event info to stdout for debugging
     DC_LOG_DEBUG("%-6u  %-6llu  %s.%s", pid, event->event_id, probe_name.c_str(),
                  function_name.c_str());
-    // Write event to Chrome trace file
+    // Resolve writer instance and route event to the appropriate payload converter.
     auto writer = datacrumbs::Singleton<datacrumbs::ChromeWriter>::get_instance();
     if (!writer) {
       DC_LOG_ERROR("Failed to create ChromeWriter instance");
@@ -194,6 +199,7 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
   return 0;
 }
 int EventProcessor::update_filename(const char* filename, unsigned int hash) {
+  // De-duplicate filename metadata records by hash to reduce trace noise and size.
   if (processed_hashes_.find(hash) != processed_hashes_.end()) {
     DC_LOG_DEBUG("Filename %s with hash %u already processed, skipping", filename, hash);
     return 0;  // Skip if already processed
@@ -212,6 +218,7 @@ int EventProcessor::update_filename(const char* filename, unsigned int hash) {
   return 0;
 }
 int EventProcessor::finalize() {
+  // Flush writer queue and close output stream after final event counters are logged.
   DC_LOG_PRINT("Collected %d events and failed %d events", event_index.load(), failed_events);
   auto writer_ = datacrumbs::Singleton<datacrumbs::ChromeWriter>::get_instance();
   if (writer_) {

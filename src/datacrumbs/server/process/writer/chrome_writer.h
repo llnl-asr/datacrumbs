@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #pragma once
 // Generated Headers
 #include <datacrumbs/datacrumbs_config.h>
@@ -24,36 +27,65 @@
 
 namespace datacrumbs {
 
+/**
+ * @brief Async writer that emits runtime events to Chrome trace format.
+ */
 class ChromeWriter {
  public:
-  // Create a ChromeWriter that writes to the given filename.
+  /**
+   * @brief Construct writer using runtime-configured output path/compression.
+   */
   ChromeWriter();
 
-  // Destructor flushes and closes the file, and joins the worker thread.
+  /**
+   * @brief Destructor flushes pending data and joins worker thread.
+   */
   ~ChromeWriter();
 
+  /**
+   * @brief Enqueue event for background serialization.
+   * @param event Heap-allocated event payload.
+   */
   void push_event(EventWithId* event);
 
-  // Serialize and write a single event to the file, including event_id as "id".
+  /**
+   * @brief Serialize and write one event immediately.
+   * @param event_with_id Event payload including runtime event_id.
+   */
   void write_event(EventWithId* event_with_id);
 
+  /**
+   * @brief Flush queued events and close output stream.
+   */
   void finalize();
 
  private:
+  /// Background consumer loop for queued events.
   void worker_loop();
 
+  /// Tracks whether next serialized event needs comma separator handling.
   bool first_event_ = true;
 
+  /// Serialize/flush mutex for output stream.
   std::mutex file_mutex_;
 
+  /// Queue of pending runtime events.
   std::deque<EventWithId*> event_queue_;
+  /// Queue mutex.
   std::mutex queue_mutex_;
+  /// Queue wait/notify condition.
   std::condition_variable queue_cv_;
+  /// Background writer thread.
   std::thread worker_;
+  /// Stop request flag for worker loop.
   bool stop_flag_;
+  /// Finalization state guard.
   bool finalized_;
+  /// Monotonic local index for emitted events.
   unsigned long index_;
+  /// Compression sink used for trace output.
   ZlibCompression* compressor_;
+  /// Compression chunk size in bytes.
   size_t chunk_size_;
 };
 

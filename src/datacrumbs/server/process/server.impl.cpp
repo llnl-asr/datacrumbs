@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 // Internal headers
 #include <datacrumbs/common/enumerations.h>
 #include <datacrumbs/common/runtime_configuration_manager.h>
@@ -92,6 +95,7 @@ static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
 static int populate_event_arg_config(
     int map_fd, uint64_t cookie, uint64_t event_id, datacrumbs::ProbeType probe_type,
     const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs) {
+  // Populate one compact per-event capture schema consumed directly by BPF programs.
   runtime_event_config_t config = {};
   config.event_id = event_id;
   config.probe_kind = runtime_probe_kind(probe_type);
@@ -125,6 +129,7 @@ static int populate_event_arg_config(
 
 static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
                                  struct datacrumbs_bpf* skel) {
+  // Resolve all generic attach programs and shared config map before per-probe loop.
   auto config_manager = event_processor->configManager_;
   auto* client_start = bpf_object__find_program_by_name(skel->obj, "trace_client_start");
   auto* client_stop = bpf_object__find_program_by_name(skel->obj, "trace_client_stop");
@@ -165,6 +170,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
   }
 
   {
+    // Always hook datacrumbs client lifecycle entry/exit points.
     struct bpf_uprobe_opts start_opts = {};
     start_opts.sz = sizeof(start_opts);
     start_opts.func_name = "datacrumbs_start";
@@ -189,6 +195,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
 
   for (const auto& probe : config_manager->runtime_probes) {
     for (const auto& function_name : probe->functions) {
+      // Resolve generated runtime event id first; attachment is skipped when mapping is missing.
       const auto event_id = config_manager->get_runtime_event_id(probe->name, function_name);
       if (!event_id.has_value()) {
         DC_LOG_WARN("Skipping runtime probe without generated event id: %s.%s", probe->name.c_str(),
@@ -199,6 +206,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
 
       const uint64_t current_cookie = cookie++;
       if (probe->type == datacrumbs::ProbeType::KPROBE) {
+        // Attach entry+exit kprobes and track runtime state success/failure.
         total_requested += 2;
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
                                       probe->getArgSpecs(function_name)) != 0) {
@@ -226,6 +234,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         runtime_probe_state_updated = true;
         total_attached += 2;
       } else if (probe->type == datacrumbs::ProbeType::SYSCALLS) {
+        // Normalize syscall names to avoid double-prefix attach failures.
         total_requested += 2;
         const std::string syscall_name = normalize_syscall_name_for_attach(function_name);
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
@@ -254,6 +263,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         runtime_probe_state_updated = true;
         total_attached += 2;
       } else if (probe->type == datacrumbs::ProbeType::UPROBE) {
+        // Attach uprobes by symbol or resolved offset target.
         total_requested += 2;
         auto uprobe = std::dynamic_pointer_cast<datacrumbs::UProbe>(probe);
         std::string symbol_name;
@@ -295,6 +305,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         runtime_probe_state_updated = true;
         total_attached += 2;
       } else if (probe->type == datacrumbs::ProbeType::USDT) {
+        // Attach USDT entry/exit probes against configured provider/function.
         total_requested += 2;
         auto usdt = std::dynamic_pointer_cast<datacrumbs::USDTProbe>(probe);
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
@@ -334,6 +345,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
   }
 
   if (runtime_probe_state_updated) {
+    // Persist latest success/failure status for runtime diagnostics/reporting.
     config_manager->persist_runtime_probe_state();
   }
 

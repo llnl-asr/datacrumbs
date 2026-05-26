@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #include <datacrumbs/server/process/writer/chrome_writer.h>
 // internal headers
 #include <datacrumbs/common/constants.h>
@@ -194,6 +197,7 @@ bool datacrumbs::Singleton<datacrumbs::ChromeWriter>::stop_creating_instances = 
 
 namespace datacrumbs {
 ChromeWriter::ChromeWriter() : stop_flag_(false), finalized_(false), chunk_size_(16 * 1024 * 1024) {
+  // Initialize compression sink with runtime-configured output path.
   auto configManager_ =
       datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
   compressor_ = new ZlibCompression(configManager_->trace_file_path, chunk_size_);
@@ -207,6 +211,7 @@ ChromeWriter::ChromeWriter() : stop_flag_(false), finalized_(false), chunk_size_
   chmod(configManager_->trace_file_path.c_str(), 0660);
   compressor_->compress("[\n");
   first_event_ = true;
+  // Start asynchronous queue consumer.
   worker_ = std::thread([this]() { this->worker_loop(); });
 }
 
@@ -218,6 +223,7 @@ ChromeWriter::~ChromeWriter() {
 }
 void ChromeWriter::finalize() {
   {
+    // Gate finalization so repeated finalize()/destructor paths remain idempotent.
     std::lock_guard<std::mutex> lock(queue_mutex_);
     if (finalized_) {
       return;
@@ -229,6 +235,7 @@ void ChromeWriter::finalize() {
   queue_cv_.notify_one();
   if (worker_.joinable()) worker_.join();
   if (compressor_ != nullptr) {
+    // Close JSON array and finalize gzip stream.
     compressor_->compress("]");
     compressor_->finalize();
   }
@@ -253,10 +260,12 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
 
   unsigned int pid = event_with_id->tgid_pid;
   unsigned int tid = event_with_id->tgid_pid >> 32;
+  // Resolve category/function labels from runtime event id mapping.
   auto it = configManager_->category_map.find(event_with_id->event_id);
   if (it != configManager_->category_map.end()) {
     std::string probe_name = it->second.first;
     std::string function_name = it->second.second;
+    // Convert nanosecond-scale counter durations to microseconds for Chrome trace readability.
     if (args != nullptr && event_with_id->event_type == COUNTER_EVENT &&
         args->find("duration") != args->end()) {
       unsigned long long duration = std::any_cast<unsigned int>((*args)["duration"]);
@@ -281,6 +290,7 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
       dur_us = static_cast<unsigned long long>(std::ceil(event_with_id->dur / 1000.0));
     }
     int len = 0;
+    // Build base event JSON for the specific phase marker type.
     if (event_with_id->event_type == COUNTER_EVENT) {
       len = std::snprintf(
           buffer, sizeof(buffer), R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c","ts":%llu)", index_,
@@ -304,6 +314,7 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
 
     bool first = true;
     if (args != nullptr && !args->empty()) {
+      // Serialize dynamic key/value args map into JSON object payload.
       for (auto pair : *args) {
         const std::string& key = pair.first;
         const std::any& value = pair.second;
@@ -339,6 +350,7 @@ void ChromeWriter::worker_loop() {
     EventWithId* event_with_id = nullptr;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
+      // Wait for either new work or explicit shutdown request.
       queue_cv_.wait(lock, [this] { return !event_queue_.empty() || stop_flag_; });
       if (event_queue_.empty() && stop_flag_) {
         break;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #ifndef DATACRUMBS_SERVER_PROCESS_DEF
 #define DATACRUMBS_SERVER_PROCESS_DEF
 // BPF Headers
@@ -37,34 +40,68 @@
 #include <utility>
 
 namespace datacrumbs {
+
+/**
+ * @brief Runtime event processor that decodes captured events and writes trace output.
+ */
 class EventProcessor {
  public:
+  /**
+   * @brief Construct the event processor for a signed runtime probe file.
+   * @param probe_file Signed probe file path.
+   *        Example: "/tmp/datacrumbs-ci-probes.json.gz".
+   */
   explicit EventProcessor(const std::filesystem::path& probe_file);
 
   ~EventProcessor() {}
 
+  /**
+   * @brief Handle one event record from the BPF ring buffer.
+   * @return 0 on success, non-zero on decode/write failure.
+   */
   int handle_event(void* data, size_t data_sz);
 
+  /**
+   * @brief Update filename cache for hash-based filename events.
+   * @return 0 on success.
+   */
   int update_filename(const char* filename, unsigned int hash);
 
+  /**
+   * @brief Capture general counter event (currently placeholder).
+   * @return Always 0 in current implementation.
+   */
   int capture_general_counter(struct profile_key_t* key, struct profile_value_t* value) {
     return 0;
   }
 
+  /**
+   * @brief Capture USDT counter event (currently placeholder).
+   * @return Always 0 in current implementation.
+   */
   int capture_usdt_counter(struct usdt_profile_key_t* key, struct profile_value_t* value) {
     return 0;
   }
 
+  /**
+   * @brief Flush and finalize trace output.
+   * @return 0 on success, non-zero on finalization error.
+   */
   int finalize();
 
  public:
+  /// Runtime configuration manager instance for this run.
   std::shared_ptr<RuntimeConfigurationManager> configManager_;
+  /// Trace writer implementation.
   std::shared_ptr<datacrumbs::ChromeWriter> writer_;
-  int failed_events;  // Count of failed events
+  /// Count of failed event-processing operations.
+  int failed_events;
+  /// Monotonic event index used to order emitted events.
   std::atomic<uint64_t> event_index{0};
 
- private:                                              // Atomic index for event processing
-  std::unordered_set<unsigned int> processed_hashes_;  // Set to track processed PIDs
+ private:
+  /// Set of processed filename hashes to avoid duplicate filename updates.
+  std::unordered_set<unsigned int> processed_hashes_;
 };
 
 }  // namespace datacrumbs

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #pragma once
 
 #include <datacrumbs/datacrumbs_config.h>
@@ -20,21 +23,39 @@
 
 namespace datacrumbs::logging_internal {
 
+/// Default interval for progress status emission.
 inline constexpr std::chrono::seconds kDefaultProgressLogInterval{5};
 
+/**
+ * @brief Mutable per-key progress bookkeeping state.
+ */
 struct ProgressState {
+  /// First observation timestamp for this progress key.
   std::chrono::steady_clock::time_point start_time;
+  /// Last time a progress line was emitted.
   std::chrono::steady_clock::time_point last_emit_time;
+  /// Last seen numeric value.
   size_t last_value = 0;
+  /// Whether state has been initialized.
   bool initialized = false;
 };
 
+/**
+ * @brief Snapshot returned from state update to decide whether to emit logs.
+ */
 struct ProgressSnapshot {
+  /// Whether caller should emit a progress line.
   bool should_emit = false;
+  /// Elapsed time in seconds.
   double elapsed_seconds = 0.0;
+  /// Average processing rate.
   double rate = 0.0;
 };
 
+/**
+ * @brief Resolve output stream for logging.
+ * @return FILE handle for active sink.
+ */
 inline FILE* get_log_file() {
 #ifdef LOG_TO_FILE
   static FILE* file = std::fopen(LOG_FILE_PATH, "a");
@@ -212,6 +233,13 @@ inline void finish_console_progress_line() {
 #endif
 }
 
+/**
+ * @brief Emit aggregated progress information with total count.
+ * @param message Progress message key.
+ * @param current Current completed count.
+ * @param total Total expected count.
+ * @param min_interval Minimum time between emissions.
+ */
 inline void log_progress(
     const std::string& message, size_t current, size_t total,
     std::chrono::steady_clock::duration min_interval = kDefaultProgressLogInterval) {
@@ -238,6 +266,12 @@ inline void log_progress(
   }
 }
 
+/**
+ * @brief Emit open-ended progress information without total.
+ * @param message Progress message key.
+ * @param current Current processed count.
+ * @param min_interval Minimum time between emissions.
+ */
 inline void log_progress(
     const std::string& message, size_t current,
     std::chrono::steady_clock::duration min_interval = kDefaultProgressLogInterval) {

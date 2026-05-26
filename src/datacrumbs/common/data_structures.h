@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #ifndef DATACRUMBS_COMMON_DATA_STRUCTURES_H__
 #define DATACRUMBS_COMMON_DATA_STRUCTURES_H__
 // include first
@@ -22,6 +25,10 @@
 #include <vector>
 
 namespace datacrumbs {
+
+/**
+ * @brief Argument capture specification for one probe function argument.
+ */
 struct ProbeArgCaptureSpec {
   unsigned int index = 0;
   unsigned int num_bytes = 0;
@@ -55,6 +62,9 @@ struct ProbeArgCaptureSpec {
   }
 };
 
+/**
+ * @brief Runtime metadata mapped by event id for fast decode/writer lookup.
+ */
 struct RuntimeEventMetadata {
   ProbeType probe_type = ProbeType::KPROBE;
   std::string probe_name;
@@ -62,6 +72,9 @@ struct RuntimeEventMetadata {
   std::vector<ProbeArgCaptureSpec> arg_specs;
 };
 
+/**
+ * @brief Unified event wrapper used by runtime writers.
+ */
 struct EventWithId {
   char event_type;
   unsigned long long index;
@@ -105,7 +118,9 @@ struct EventWithId {
         args(other.args) {}
 };
 
-// Base class representing a generic probe
+/**
+ * @brief Base probe definition shared by runtime probe variants.
+ */
 class Probe {
  public:
   // Default constructor
@@ -230,7 +245,9 @@ class Probe {
   }
 };
 
-// Probe for system calls
+/**
+ * @brief Probe definition for syscall function lists.
+ */
 struct SysCallProbe : public Probe {
  public:
   SysCallProbe(const SysCallProbe& other) : Probe(other) {
@@ -263,7 +280,9 @@ struct SysCallProbe : public Probe {
   }
 };
 
-// Probe for kernel functions (kprobes)
+/**
+ * @brief Probe definition for kernel kprobes.
+ */
 struct KProbe : public Probe {
  public:
   KProbe(const KProbe& other) : Probe(other) { DC_LOG_TRACE("KProbe copy constructor called"); }
@@ -296,7 +315,9 @@ struct KProbe : public Probe {
   }
 };
 
-// Probe for user-space functions (uprobes)
+/**
+ * @brief Probe definition for user-space uprobes.
+ */
 struct UProbe : public Probe {
  public:
   UProbe(const UProbe& other)
@@ -347,7 +368,9 @@ struct UProbe : public Probe {
   }
 };
 
-// Probe for USDT (User-level Statically Defined Tracing) probes
+/**
+ * @brief Probe definition for USDT probes.
+ */
 struct USDTProbe : public Probe {
  public:
   USDTProbe(const USDTProbe& other)
@@ -404,7 +427,9 @@ struct USDTProbe : public Probe {
   }
 };
 
-// Probe for USDT (User-level Statically Defined Tracing) probes
+/**
+ * @brief Probe definition for custom BPF-based probes.
+ */
 struct CustomProbe : public Probe {
  public:
   CustomProbe(const CustomProbe& other)
@@ -484,7 +509,9 @@ struct CustomProbe : public Probe {
   }
 };
 
-// Base class for capture probes (used for capturing symbols, headers, binaries, etc.)
+/**
+ * @brief Base configuration for explorer capture sources.
+ */
 class CaptureProbe {
  public:
   // Constructor initializing the capture type
@@ -536,7 +563,9 @@ class CaptureProbe {
   }
 };
 
-// Capture probe for kernel symbols
+/**
+ * @brief Capture probe for kernel symbol source.
+ */
 class KernelCaptureProbe : public CaptureProbe {
  public:
   KernelCaptureProbe() : CaptureProbe(CaptureType::KSYM) {
@@ -544,7 +573,9 @@ class KernelCaptureProbe : public CaptureProbe {
   }
 };
 
-// Capture probe for header files
+/**
+ * @brief Capture probe for header-based symbol extraction.
+ */
 class HeaderCaptureProbe : public CaptureProbe {
  public:
   HeaderCaptureProbe() : CaptureProbe(CaptureType::HEADER), file() {
@@ -553,7 +584,9 @@ class HeaderCaptureProbe : public CaptureProbe {
   std::string file;  // Name of the header to capture
 };
 
-// Capture probe for binaries
+/**
+ * @brief Capture probe for ELF binary symbol extraction.
+ */
 class BinaryCaptureProbe : public CaptureProbe {
  public:
   BinaryCaptureProbe() : CaptureProbe(CaptureType::BINARY), file(), include_offsets(false) {
@@ -563,7 +596,9 @@ class BinaryCaptureProbe : public CaptureProbe {
   bool include_offsets;
 };
 
-// Capture probe for USDT probes
+/**
+ * @brief Capture probe for USDT provider/function extraction.
+ */
 class USDTCaptureProbe : public CaptureProbe {
  public:
   USDTCaptureProbe() : CaptureProbe(CaptureType::USDT), binary_path(), provider() {

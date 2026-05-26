@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #ifndef __DATACRUMBS_SERVER_BPF_COMMON_H
 #define __DATACRUMBS_SERVER_BPF_COMMON_H
 
@@ -37,6 +40,9 @@ DATACRUMBS_MAP_EXTERN(file_map, char[MAX_STR_READ_LEN], u32, 1024);
 DATACRUMBS_TRIE_EXTERN(inclusion_path_trie, struct string_t, struct string_t);
 #endif
 
+/**
+ * @brief Hash fixed-length string content (djb2 variant capped for BPF loops).
+ */
 static inline __attribute__((always_inline)) u32 hash_str(const char* str, size_t len) {
   u32 hash = 5381;
   for (int i = 0; i < 128; ++i) {
@@ -46,6 +52,9 @@ static inline __attribute__((always_inline)) u32 hash_str(const char* str, size_
   return hash;
 }
 
+/**
+ * @brief Resolve/insert filename hash in file_map cache.
+ */
 static inline __attribute__((always_inline)) u32 hash_and_store(struct string_t* str, size_t len) {
   u32* existing = bpf_map_lookup_elem(&file_map, str);
   if (existing) {
@@ -57,6 +66,9 @@ static inline __attribute__((always_inline)) u32 hash_and_store(struct string_t*
   return hash;
 }
 
+/**
+ * @brief Prefix lookup for path-filter trie (or allow-all when disabled).
+ */
 #if defined(DATACRUMBS_ENABLE_INCLUSION_PATH) && (DATACRUMBS_ENABLE_INCLUSION_PATH == 1)
 // Returns 1 if any prefix in trie matches 'str' of length 'len', else 0
 static inline __attribute__((always_inline)) int prefix_search(void* trie, struct string_t* key) {
@@ -95,6 +107,9 @@ static inline __attribute__((always_inline)) int prefix_search(void* trie, struc
 }
 #endif
 
+/**
+ * @brief Increment failed-event accounting map when output reservation fails.
+ */
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 static inline __attribute__((always_inline)) int mark_failed_events() {
@@ -120,6 +135,9 @@ static inline __attribute__((always_inline)) int mark_failed_events() {
 #endif
 #endif
 
+/**
+ * @brief Determine whether current pid/tgid should be traced.
+ */
 #if defined(DATACRUMBS_TRACE_ALL_PROCESSES) && (DATACRUMBS_TRACE_ALL_PROCESSES == 1)
 static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* key, u64* start_ts) {
   key->id = bpf_get_current_pid_tgid();
@@ -136,17 +154,26 @@ static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* k
 }
 #endif
 
+/**
+ * @brief Resolve runtime event configuration using attach cookie/event id.
+ */
 static inline __attribute__((always_inline)) const struct runtime_event_config_t*
 resolve_event_config(u64 attach_cookie) {
   return (const struct runtime_event_config_t*)bpf_map_lookup_elem(&event_arg_config_map,
                                                                    &attach_cookie);
 }
 
+/**
+ * @brief Get reusable per-cpu scratch value entry.
+ */
 static inline __attribute__((always_inline)) struct fn_value_t* get_scratch_fn_value(void) {
   u32 key = 0;
   return (struct fn_value_t*)bpf_map_lookup_elem(&scratch_fn_value_map, &key);
 }
 
+/**
+ * @brief Mark current pid as trace-enabled in pid map.
+ */
 static inline __attribute__((always_inline)) int mark_current_pid_traced(void) {
   const u64 tsp = bpf_ktime_get_ns();
   const u64 current = bpf_get_current_pid_tgid();
@@ -157,6 +184,9 @@ static inline __attribute__((always_inline)) int mark_current_pid_traced(void) {
   return 0;
 }
 
+/**
+ * @brief Remove current pid from trace-enabled pid map.
+ */
 static inline __attribute__((always_inline)) int unmark_current_pid_traced(void) {
   const u64 current = bpf_get_current_pid_tgid();
   const u32 pid = current & 0xFFFFFFFF;
@@ -166,6 +196,9 @@ static inline __attribute__((always_inline)) int unmark_current_pid_traced(void)
   return 0;
 }
 
+/**
+ * @brief Reset captured-argument buffers before a new probe hit.
+ */
 static inline __attribute__((always_inline)) void reset_captured_args(struct fn_value_t* fn) {
 #pragma unroll
   for (int index = 0; index < DATACRUMBS_MAX_CAPTURE_ARGS; ++index) {
@@ -177,6 +210,9 @@ static inline __attribute__((always_inline)) void reset_captured_args(struct fn_
   fn->arg_count = 0;
 }
 
+/**
+ * @brief Copy captured argument state into userspace event payload.
+ */
 static inline __attribute__((always_inline)) void copy_captured_args_to_event(
     const struct fn_value_t* fn, struct generic_event_t* event) {
   event->arg_count = fn->arg_count;
@@ -189,6 +225,9 @@ static inline __attribute__((always_inline)) void copy_captured_args_to_event(
   }
 }
 
+/**
+ * @brief Capture runtime args from pt_regs according to config schema.
+ */
 static inline __attribute__((always_inline)) void capture_runtime_args(
     struct pt_regs* ctx, const struct runtime_event_config_t* config, struct fn_value_t* fn) {
   unsigned int arg_index;
@@ -247,6 +286,9 @@ static inline __attribute__((always_inline)) void capture_runtime_args(
   }
 }
 
+/**
+ * @brief Capture runtime args from pre-resolved raw arg values.
+ */
 static inline __attribute__((always_inline)) void capture_runtime_raw_args(
     const struct runtime_event_config_t* config, struct fn_value_t* fn, unsigned long long raw_arg0,
     unsigned long long raw_arg1, unsigned long long raw_arg2, unsigned long long raw_arg3,
@@ -302,6 +344,9 @@ static inline __attribute__((always_inline)) void capture_runtime_raw_args(
   }
 }
 
+/**
+ * @brief Capture USDT arguments using bpf_usdt_arg helpers.
+ */
 static inline __attribute__((always_inline)) void capture_runtime_usdt_args(
     struct pt_regs* ctx, const struct runtime_event_config_t* config, struct fn_value_t* fn) {
   long raw_value = 0;
