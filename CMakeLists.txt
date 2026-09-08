@@ -100,6 +100,18 @@ option(DATACRUMBS_BUILD_ONLY "Build only the datacrumbs library without installa
 cmake_host_system_information(RESULT DATACRUMBS_DEFAULT_PROBE_MANAGER_TCP_HOST QUERY HOSTNAME)
 set(DATACRUMBS_PROBE_MANAGER_TCP_HOST "${DATACRUMBS_DEFAULT_PROBE_MANAGER_TCP_HOST}" CACHE STRING "Host address for datacrumbs probe manager RPC service")
 set(DATACRUMBS_PROBE_MANAGER_TCP_PORT "43123" CACHE STRING "TCP port for datacrumbs probe manager RPC service")
+# Resource bounds for the probe manager RPC service. The read path runs before a
+# caller is authenticated, so these limits are what stop an unauthenticated peer
+# from starving the service.
+set(DATACRUMBS_PROBE_MANAGER_MAX_REQUEST_BYTES "8388608" CACHE STRING "Maximum accepted request size in bytes for the probe manager")
+set(DATACRUMBS_PROBE_MANAGER_REQUEST_TIMEOUT_SECONDS "30" CACHE STRING "Per-connection deadline in seconds for probe manager requests")
+set(DATACRUMBS_PROBE_MANAGER_MAX_CONNECTIONS "32" CACHE STRING "Maximum concurrent probe manager connections")
+set(DATACRUMBS_MAX_PROBE_CATEGORIES "4096" CACHE STRING "Maximum probe categories accepted in one signing payload")
+# Lifetime of a probe signature. A signed probe file stops being accepted at load
+# time once this elapses, bounding how long a leaked file remains usable.
+set(DATACRUMBS_PROBE_SIGNATURE_TTL_SECONDS "604800" CACHE STRING "Seconds a datacrumbs probe signature remains valid")
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/find_munge.cmake)
 
 # ------------------------------------------------------------------------------
 # Derive CMake variables based on options
@@ -164,6 +176,11 @@ set(DATACRUMBS_SYSTEM_CONFIGURATION_DEFINE_KEYS
     DATACRUMBS_LIBC_SO
     DATACRUMBS_PROBE_MANAGER_TCP_HOST
     DATACRUMBS_PROBE_MANAGER_TCP_PORT
+    DATACRUMBS_PROBE_MANAGER_MAX_REQUEST_BYTES
+    DATACRUMBS_PROBE_MANAGER_REQUEST_TIMEOUT_SECONDS
+    DATACRUMBS_PROBE_MANAGER_MAX_CONNECTIONS
+    DATACRUMBS_MAX_PROBE_CATEGORIES
+    DATACRUMBS_PROBE_SIGNATURE_TTL_SECONDS
 )
 
 set(DATACRUMBS_INSTALL_PREFIX "${DATACRUMBS_INSTALL_PREFIX_PATH}")
@@ -327,7 +344,7 @@ set(DATACRUMBS_PROBE_MANAGER_SERVICE_SRC
 )
 
 add_executable(datacrumbs_probe_manager ${DATACRUMBS_PROBE_MANAGER_SERVICE_SRC} ${DATACRUMBS_COMMON_SRC})
-target_link_libraries(datacrumbs_probe_manager ${DEPENDENCY_LIB})
+target_link_libraries(datacrumbs_probe_manager ${DEPENDENCY_LIB} Munge::Munge)
 install(TARGETS datacrumbs_probe_manager
     RUNTIME DESTINATION "${DATACRUMBS_INSTALL_SBINARYDIR}"
 )

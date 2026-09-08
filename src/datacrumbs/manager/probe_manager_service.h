@@ -4,6 +4,8 @@
 #ifndef DATACRUMBS_MANAGER_PROBE_MANAGER_SERVICE_H__
 #define DATACRUMBS_MANAGER_PROBE_MANAGER_SERVICE_H__
 
+#include <sys/types.h>
+
 #include <string>
 #include <vector>
 
@@ -81,8 +83,8 @@ class ProbeManagerService {
   * @param request_id JSON-RPC request id.
   *        Example: "runtime-state-1" or "42".
   * @param ok true to emit a `result` object, false to emit an `error` object.
-  * @param payload Success payload used as checksum value when `ok=true`.
-  *        Example: "f1a5..." or "accepted".
+  * @param payload Success payload emitted as the `document` result when `ok=true`.
+  *        Example: a complete signed probe document, or "accepted".
   * @param error Error message when `ok=false`.
   *        Example: "missing signing payload".
   * @param error_code JSON-RPC error code when `ok=false`.
@@ -122,12 +124,19 @@ class ProbeManagerService {
   *
   * @param signing_payload JSON payload to validate/sign.
   *        Example: "{\"summary\":...,\"categories\":...,\"checksum_algorithm\":\"hmac-sha256\"}".
+  * @param caller_uid Caller uid attested by munge, injected into the summary so
+  *        the identity in the signed document is never client-asserted.
+  *        Example: 35619.
+  * @param caller_gid Caller primary gid attested by munge. Example: 35619.
   * @param error Output message set when signing fails.
   *        Example: "payload validation failed (...)".
-  * @return Non-empty HMAC checksum on success, empty string on failure.
+  * @return Complete signed document on success, empty string on failure. The
+  *         caller must persist these bytes verbatim: the manager injects summary
+  *         fields, so a client-rebuilt document would not match the signature.
   * @throws No explicit exceptions are thrown.
   */
-  std::string sign_signing_payload(const std::string& signing_payload, std::string* error) const;
+  std::string sign_signing_payload(const std::string& signing_payload, uid_t caller_uid,
+                                   gid_t caller_gid, std::string* error) const;
 
   /**
   * @brief Authenticate and persist runtime probe state reported by a runtime node.
@@ -149,13 +158,15 @@ class ProbeManagerService {
   *
   * @param signing_payload JSON payload to validate.
   *        Example: signed payload input used by `sign_signing_payload`.
+  * @param caller_uid Caller uid attested by munge. Example: 35619.
+  * @param caller_gid Caller primary gid attested by munge. Example: 35619.
   * @param errors Output list collecting all validation failures.
   *        Example entry: "payload.categories[0].functions[2] kernel symbol not found in /proc/kallsyms".
   * @return true when payload is valid, false when one or more checks fail.
   * @throws No explicit exceptions are thrown.
   */
-  bool validate_signing_payload(const std::string& signing_payload,
-                                std::vector<std::string>* errors) const;
+  bool validate_signing_payload(const std::string& signing_payload, uid_t caller_uid,
+                                gid_t caller_gid, std::vector<std::string>* errors) const;
 
   /**
   * @brief Persist runtime probe state entries into sqlite storage.

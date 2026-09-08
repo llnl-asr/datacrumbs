@@ -594,9 +594,22 @@ void RuntimeConfigurationManager::load_runtime_system_configuration() {
 }
 
 void RuntimeConfigurationManager::load_runtime_probe_file() {
+  // The probe file path is chosen by the submitting user (via the Flux jobspec or
+  // the Slurm job comment), so a valid signature alone is not enough: it must be
+  // a document signed for this run's user. Without this, any readable probe file
+  // signed for someone else would be accepted and attached as root.
+  uid_t expected_uid = datacrumbs::probe_file::kAnyUid;
+  if (!user.empty()) {
+    if (const struct passwd* pwd = getpwnam(user.c_str()); pwd != nullptr) {
+      expected_uid = pwd->pw_uid;
+    } else {
+      throw std::runtime_error("Failed to resolve runtime user for probe verification: " + user);
+    }
+  }
+
   std::string probe_error;
-  json_object* categories =
-      datacrumbs::probe_file::load_verified_categories_from_file(probe_file_path, &probe_error);
+  json_object* categories = datacrumbs::probe_file::load_verified_categories_from_file(
+      probe_file_path, &probe_error, expected_uid);
   if (!categories || json_object_get_type(categories) != json_type_array) {
     if (categories) json_object_put(categories);
     throw std::runtime_error("Failed to verify runtime probe file: " + probe_file_path.string() +

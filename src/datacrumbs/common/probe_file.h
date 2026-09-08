@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <zlib.h>
 
+#include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -204,6 +206,47 @@ inline std::string hmac_sha256_hex(const std::string& secret, const std::string&
 }
 
 /**
+ * @brief Compute SHA-256 of a payload in hex form.
+ *
+ * Used to bind a munge credential to the exact request it accompanies, so a
+ * credential captured inside its TTL cannot be replayed against a different
+ * payload.
+ *
+ * @param payload Payload to digest. Example: a serialized signing payload.
+ * @return Hex digest, or empty string on digest failure.
+ */
+inline std::string sha256_hex(const std::string& payload) {
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  unsigned int digest_len = 0;
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  if (ctx == nullptr) {
+    return "";
+  }
+  const bool ok = EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
+                  EVP_DigestUpdate(ctx, payload.data(), payload.size()) == 1 &&
+                  EVP_DigestFinal_ex(ctx, digest, &digest_len) == 1;
+  EVP_MD_CTX_free(ctx);
+  if (!ok) {
+    return "";
+  }
+  return bytes_to_hex(digest, digest_len);
+}
+
+/**
+ * @brief Schema version of the signed probe document.
+ *
+ * Version "2" replaced the client-asserted `user` field with a manager-injected
+ * numeric `uid`, and added `expires_at`. Documents without a matching version
+ * are rejected rather than interpreted under the old rules.
+ */
+inline constexpr const char* kProbeSchemaVersion = "2";
+
+/**
+ * @brief Sentinel meaning "do not enforce a uid" when verifying a document.
+ */
+inline constexpr uid_t kAnyUid = static_cast<uid_t>(-1);
+
+/**
  * @brief Serialize categories object for signing.
  * @param categories JSON categories array/object.
  * @return Compact JSON payload string.
@@ -264,7 +307,8 @@ inline json_object* build_signed_categories_document(
  * @return Borrowed categories object reference on success, nullptr on failure.
  */
 inline json_object* verified_categories_from_root(json_object* root, const std::string& secret,
-                                                  std::string* error = nullptr) {
+                                                  std::string* error = nullptr,
+                                                  uid_t expected_uid = kAnyUid) {
   if (root == nullptr || json_object_get_type(root) != json_type_object) {
     if (error != nullptr) {
       *error = "probe file root must be a JSON object";
@@ -317,6 +361,57 @@ inline json_object* verified_categories_from_root(json_object* root, const std::
     return nullptr;
   }
 
+  // A valid signature only proves the manager produced this document. It must
+  // also be the document this consumer is entitled to use, otherwise any signed
+  // probe file is a bearer token usable by any user on any node.
+  json_object* schema_obj = nullptr;
+  if (!json_object_object_get_ex(summary, "schema_version", &schema_obj) ||
+      json_object_get_type(schema_obj) != json_type_string ||
+      std::string(json_object_get_string(schema_obj)) != kProbeSchemaVersion) {
+    if (error != nullptr) {
+      *error = std::string("probe file schema version is not '") + kProbeSchemaVersion +
+               "'; regenerate the probe file";
+    }
+    return nullptr;
+  }
+
+  json_object* expires_obj = nullptr;
+  if (!json_object_object_get_ex(summary, "expires_at", &expires_obj) ||
+      json_object_get_type(expires_obj) != json_type_int) {
+    if (error != nullptr) {
+      *error = "probe file summary is missing expires_at";
+    }
+    return nullptr;
+  }
+  const std::int64_t expires_at = json_object_get_int64(expires_obj);
+  const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+  if (now >= expires_at) {
+    if (error != nullptr) {
+      *error = "probe file signature expired at " + std::to_string(expires_at) + " (now " +
+               std::to_string(now) + "); regenerate the probe file";
+    }
+    return nullptr;
+  }
+
+  json_object* uid_obj = nullptr;
+  if (!json_object_object_get_ex(summary, "uid", &uid_obj) ||
+      json_object_get_type(uid_obj) != json_type_int) {
+    if (error != nullptr) {
+      *error = "probe file summary is missing uid";
+    }
+    return nullptr;
+  }
+  if (expected_uid != kAnyUid) {
+    const uid_t document_uid = static_cast<uid_t>(json_object_get_int64(uid_obj));
+    if (document_uid != expected_uid) {
+      if (error != nullptr) {
+        *error = "probe file was signed for uid " + std::to_string(document_uid) +
+                 " but is being loaded for uid " + std::to_string(expected_uid);
+      }
+      return nullptr;
+    }
+  }
+
   return json_object_get(categories);
 }
 
@@ -327,7 +422,8 @@ inline json_object* verified_categories_from_root(json_object* root, const std::
  * @return Categories JSON object on success, nullptr on failure.
  */
 inline json_object* load_verified_categories_from_file(const std::filesystem::path& path,
-                                                       std::string* error = nullptr) {
+                                                       std::string* error = nullptr,
+                                                       uid_t expected_uid = kAnyUid) {
   std::string secret;
   if (!ensure_probe_secret(&secret)) {
     if (error != nullptr) {
@@ -352,7 +448,7 @@ inline json_object* load_verified_categories_from_file(const std::filesystem::pa
     return nullptr;
   }
 
-  json_object* categories = verified_categories_from_root(root, secret, error);
+  json_object* categories = verified_categories_from_root(root, secret, error, expected_uid);
   json_object_put(root);
   return categories;
 }
