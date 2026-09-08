@@ -46,8 +46,8 @@ struct ProgressState {
 struct ProgressSnapshot {
   /// Whether caller should emit a progress line.
   bool should_emit = false;
-  /// Elapsed time in seconds.
-  double elapsed_seconds = 0.0;
+  /// Time elapsed since the tracked operation started.
+  std::chrono::duration<double> elapsed{0.0};
   /// Average processing rate.
   double rate = 0.0;
 };
@@ -162,19 +162,32 @@ inline std::string format_compact_count(double value) {
   return result;
 }
 
-inline std::string format_elapsed(double elapsed_seconds) {
+/**
+ * @brief Render an elapsed duration as "1h 2m 3s", "2m 3s" or "3.21s".
+ *
+ * Units are split with duration_cast rather than by dividing a seconds count,
+ * so the conversion factors are supplied and checked by the type system instead
+ * of appearing as literals. duration_cast truncates toward zero, which is what
+ * the whole-unit fields want.
+ *
+ * @param elapsed Duration to render. Example: 90s renders as "1m 30s".
+ * @return Formatted duration string.
+ */
+inline std::string format_elapsed(std::chrono::duration<double> elapsed) {
   char buffer[64];
-  const int total_seconds = static_cast<int>(elapsed_seconds);
-  const int hours = total_seconds / 3600;
-  const int minutes = (total_seconds % 3600) / 60;
-  const int seconds = total_seconds % 60;
+  const auto hours = std::chrono::duration_cast<std::chrono::hours>(elapsed);
+  const auto minutes = std::chrono::duration_cast<std::chrono::minutes>(elapsed - hours);
+  const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed - hours - minutes);
 
-  if (hours > 0) {
-    std::snprintf(buffer, sizeof(buffer), "%dh %dm %ds", hours, minutes, seconds);
-  } else if (minutes > 0) {
-    std::snprintf(buffer, sizeof(buffer), "%dm %ds", minutes, seconds);
+  if (hours.count() > 0) {
+    std::snprintf(buffer, sizeof(buffer), "%lldh %lldm %llds",
+                  static_cast<long long>(hours.count()), static_cast<long long>(minutes.count()),
+                  static_cast<long long>(seconds.count()));
+  } else if (minutes.count() > 0) {
+    std::snprintf(buffer, sizeof(buffer), "%lldm %llds", static_cast<long long>(minutes.count()),
+                  static_cast<long long>(seconds.count()));
   } else {
-    std::snprintf(buffer, sizeof(buffer), "%.2fs", elapsed_seconds);
+    std::snprintf(buffer, sizeof(buffer), "%.2fs", elapsed.count());
   }
   return buffer;
 }
@@ -203,10 +216,10 @@ inline ProgressSnapshot update_progress_state(const std::string& key, size_t cur
 
   ProgressSnapshot snapshot;
   snapshot.should_emit = true;
-  snapshot.elapsed_seconds =
-      std::chrono::duration_cast<std::chrono::duration<double>>(now - state.start_time).count();
-  snapshot.rate = snapshot.elapsed_seconds > 0.0
-                      ? static_cast<double>(current) / snapshot.elapsed_seconds
+  snapshot.elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
+      now - state.start_time);
+  snapshot.rate = snapshot.elapsed.count() > 0.0
+                      ? static_cast<double>(current) / snapshot.elapsed.count()
                       : 0.0;
 
   if (completed) {
@@ -254,14 +267,14 @@ inline void log_progress(
       total > 0 ? (100.0 * static_cast<double>(current) / static_cast<double>(total)) : 0.0;
   const std::string line = message + " [" + std::to_string(current) + "/" + std::to_string(total) +
                            "] " + std::to_string(static_cast<int>(percent)) + "% completed | " +
-                           format_elapsed(snapshot.elapsed_seconds) + " elapsed | " +
+                           format_elapsed(snapshot.elapsed) + " elapsed | " +
                            format_compact_count(snapshot.rate) + " events/s";
   emit_progress_line(line);
 
   if (completed) {
     finish_console_progress_line();
     write_log_line("PRINT", message +
-                                " done. Total time: " + format_elapsed(snapshot.elapsed_seconds) +
+                                " done. Total time: " + format_elapsed(snapshot.elapsed) +
                                 ", Avg rate: " + format_compact_count(snapshot.rate) + " events/s");
   }
 }
@@ -281,7 +294,7 @@ inline void log_progress(
   }
 
   const std::string line = message + " [" + format_compact_count(static_cast<double>(current)) +
-                           " events] | " + format_elapsed(snapshot.elapsed_seconds) +
+                           " events] | " + format_elapsed(snapshot.elapsed) +
                            " elapsed | " + format_compact_count(snapshot.rate) + " events/s";
   emit_progress_line(line);
 }

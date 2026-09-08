@@ -192,10 +192,6 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
     DC_LOG_WARN("No category found for event_id %llu", event->event_id);
   }
   DC_LOG_TRACE("handle_event: end");
-  // std::string progress_msg =
-  //     "Processed events failed: " + std::to_string(failed_events) + " current:";
-  // if (configManager_->mpi_rank == 0) DC_LOG_PROGRESS_SINGLE_THROTTLED(progress_msg.c_str(),
-  // event_index, 5);
   return 0;
 }
 int EventProcessor::update_filename(const char* filename, unsigned int hash) {

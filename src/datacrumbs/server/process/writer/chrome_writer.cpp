@@ -10,6 +10,7 @@
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/bpf/shared.h>
 #include <datacrumbs/server/process/compress/zlib_compressor.h>
+#include <json-c/json.h>
 
 #include <cstring>
 #include <iomanip>
@@ -18,43 +19,27 @@
 
 namespace {
 
-std::string json_escape(const std::string& input) {
-  std::string escaped;
-  escaped.reserve(input.size() + 8);
-  for (unsigned char ch : input) {
-    switch (ch) {
-      case '\"':
-        escaped += "\\\"";
-        break;
-      case '\\':
-        escaped += "\\\\";
-        break;
-      case '\b':
-        escaped += "\\b";
-        break;
-      case '\f':
-        escaped += "\\f";
-        break;
-      case '\n':
-        escaped += "\\n";
-        break;
-      case '\r':
-        escaped += "\\r";
-        break;
-      case '\t':
-        escaped += "\\t";
-        break;
-      default:
-        if (ch < 0x20) {
-          char buffer[8];
-          std::snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
-          escaped += buffer;
-        } else {
-          escaped += static_cast<char>(ch);
-        }
-    }
+/**
+ * @brief Render a string as a quoted, escaped JSON string literal.
+ *
+ * Escaping is delegated to json-c rather than hand-rolled. NOSLASHESCAPE keeps
+ * forward slashes literal, which matters because most values here are file
+ * paths, and _len is used so a value containing an embedded NUL is not
+ * truncated at it.
+ *
+ * @param input Raw bytes to render. Example: "/usr/lib64/libc.so.6".
+ * @return Quoted JSON string including the surrounding double quotes.
+ */
+std::string json_quoted(const std::string& input) {
+  json_object* value = json_object_new_string_len(input.data(), static_cast<int>(input.size()));
+  if (value == nullptr) {
+    return "\"\"";
   }
-  return escaped;
+  const char* rendered = json_object_to_json_string_ext(
+      value, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+  std::string result = rendered != nullptr ? rendered : "\"\"";
+  json_object_put(value);
+  return result;
 }
 
 std::string bytes_to_hex(const std::vector<unsigned char>& bytes) {
@@ -139,7 +124,7 @@ std::string serialize_captured_argument(const CapturedArgumentValue& value) {
           if (ch == '\0') break;
           text.push_back(static_cast<char>(ch));
         }
-        return "\"" + json_escape(text) + "\"";
+        return json_quoted(text);
       }
       std::ostringstream oss;
       oss << "{\"value\":" << decode_scalar_json(value)
@@ -174,9 +159,9 @@ std::string serialize_any_value(const std::any& value) {
   } else if (value.type() == typeid(double)) {
     return std::to_string(std::any_cast<double>(value));
   } else if (value.type() == typeid(const char*)) {
-    return "\"" + json_escape(std::any_cast<const char*>(value)) + "\"";
+    return json_quoted(std::any_cast<const char*>(value));
   } else if (value.type() == typeid(std::string)) {
-    return "\"" + json_escape(std::any_cast<std::string>(value)) + "\"";
+    return json_quoted(std::any_cast<std::string>(value));
   } else if (value.type() == typeid(CapturedArgumentValue)) {
     return serialize_captured_argument(std::any_cast<CapturedArgumentValue>(value));
   }
