@@ -33,7 +33,8 @@ class RuntimeConfigurationManager {
  public:
   /**
    * @brief Default constructor is intentionally invalid for normal runtime usage.
-   * @throws std::runtime_error in implementation to force explicit runtime probe path initialization.
+   * @throws std::runtime_error in implementation to force explicit runtime probe path
+   * initialization.
    */
   RuntimeConfigurationManager();
 

@@ -135,8 +135,8 @@ inline std::vector<unsigned char> base64_decode(const std::string& encoded_strin
 class Timer {
  public:
   /**
-  * @brief Construct timer with zero elapsed time.
-  */
+   * @brief Construct timer with zero elapsed time.
+   */
   Timer() : elapsed_time(0) {
     // Trace constructor entry
     DC_LOG_TRACE("Timer constructed, elapsed_time initialized to 0");

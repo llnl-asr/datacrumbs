@@ -9,8 +9,8 @@
 #include <datacrumbs/common/probe_file.h>
 #include <datacrumbs/datacrumbs_config.h>
 #include <grp.h>
-#include <munge.h>
 #include <json-c/json.h>
+#include <munge.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pwd.h>
@@ -22,11 +22,11 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <cerrno>
-#include <cstring>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <mutex>
@@ -530,15 +530,14 @@ int ProbeManagerService::run() {
     if (active_connections.load() >= DATACRUMBS_PROBE_MANAGER_MAX_CONNECTIONS) {
       DC_LOG_WARN("Refusing manager connection: %d concurrent connections already active",
                   DATACRUMBS_PROBE_MANAGER_MAX_CONNECTIONS);
-      write_all_to_fd(client_fd,
-                      build_response("", false, "", "manager service is busy", -32603));
+      write_all_to_fd(client_fd, build_response("", false, "", "manager service is busy", -32603));
       close(client_fd);
       continue;
     }
 
     // Bound every send and receive on this socket so a peer that stalls mid
     // transfer cannot pin the thread past the deadline.
-    struct timeval timeout {};
+    struct timeval timeout{};
     timeout.tv_sec = DATACRUMBS_PROBE_MANAGER_REQUEST_TIMEOUT_SECONDS;
     timeout.tv_usec = 0;
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -681,9 +680,8 @@ void ProbeManagerService::handle_client(int client_fd) const {
     // root-run client obtain probes that bypass every per-user access check.
     if (caller.uid == 0) {
       DC_LOG_WARN("Rejected signing request from uid 0");
-      write_all_to_fd(
-          client_fd,
-          build_response(request_id, false, "", "uid 0 may not request probe signing", -32600));
+      write_all_to_fd(client_fd, build_response(request_id, false, "",
+                                                "uid 0 may not request probe signing", -32600));
       return;
     }
 
@@ -720,9 +718,8 @@ void ProbeManagerService::handle_client(int client_fd) const {
   // which, so the attested uid is checked as well.
   if (caller.uid != 0) {
     DC_LOG_WARN("Rejected runtime state report from uid %u", static_cast<unsigned>(caller.uid));
-    write_all_to_fd(
-        client_fd,
-        build_response(request_id, false, "", "only root may report runtime probe state", -32600));
+    write_all_to_fd(client_fd, build_response(request_id, false, "",
+                                              "only root may report runtime probe state", -32600));
     return;
   }
 
@@ -863,8 +860,8 @@ std::string ProbeManagerService::sign_signing_payload(const std::string& request
     return "";
   }
 
-  const std::int64_t expires_at = static_cast<std::int64_t>(std::time(nullptr)) +
-                                  DATACRUMBS_PROBE_SIGNATURE_TTL_SECONDS;
+  const std::int64_t expires_at =
+      static_cast<std::int64_t>(std::time(nullptr)) + DATACRUMBS_PROBE_SIGNATURE_TTL_SECONDS;
   json_object_object_add(summary, "uid",
                          json_object_new_int64(static_cast<std::int64_t>(caller_uid)));
   json_object_object_add(summary, "schema_version",
@@ -979,7 +976,6 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
       validate_path_access_for_caller(caller, "payload.summary.config_file_path", config_path,
                                       errors, &ok);
     }
-
   }
 
   // Step 3/4: Validate each category/probe entry and function list constraints.

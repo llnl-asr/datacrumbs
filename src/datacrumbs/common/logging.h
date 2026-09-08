@@ -216,8 +216,8 @@ inline ProgressSnapshot update_progress_state(const std::string& key, size_t cur
 
   ProgressSnapshot snapshot;
   snapshot.should_emit = true;
-  snapshot.elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
-      now - state.start_time);
+  snapshot.elapsed =
+      std::chrono::duration_cast<std::chrono::duration<double>>(now - state.start_time);
   snapshot.rate = snapshot.elapsed.count() > 0.0
                       ? static_cast<double>(current) / snapshot.elapsed.count()
                       : 0.0;
@@ -273,8 +273,7 @@ inline void log_progress(
 
   if (completed) {
     finish_console_progress_line();
-    write_log_line("PRINT", message +
-                                " done. Total time: " + format_elapsed(snapshot.elapsed) +
+    write_log_line("PRINT", message + " done. Total time: " + format_elapsed(snapshot.elapsed) +
                                 ", Avg rate: " + format_compact_count(snapshot.rate) + " events/s");
   }
 }
@@ -294,8 +293,8 @@ inline void log_progress(
   }
 
   const std::string line = message + " [" + format_compact_count(static_cast<double>(current)) +
-                           " events] | " + format_elapsed(snapshot.elapsed) +
-                           " elapsed | " + format_compact_count(snapshot.rate) + " events/s";
+                           " events] | " + format_elapsed(snapshot.elapsed) + " elapsed | " +
+                           format_compact_count(snapshot.rate) + " events/s";
   emit_progress_line(line);
 }
 

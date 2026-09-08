@@ -22,11 +22,11 @@ template <typename T>
 class Singleton {
  public:
   /**
-  * @brief Get or create singleton instance.
-  * @tparam Args Constructor argument types for T.
-  * @param args Constructor arguments forwarded to T when first created.
-  * @return Shared pointer to singleton instance; nullptr if finalized.
-  */
+   * @brief Get or create singleton instance.
+   * @tparam Args Constructor argument types for T.
+   * @param args Constructor arguments forwarded to T when first created.
+   * @return Shared pointer to singleton instance; nullptr if finalized.
+   */
   template <typename... Args>
   static std::shared_ptr<T> get_instance(Args... args) {
     DC_LOG_TRACE("Entering Singleton::get_instance");
