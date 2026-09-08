@@ -60,6 +60,15 @@ struct usdt_event_t {
 #define MAX_STR_READ_LEN 256
 
 /**
+ * @brief Probe does not produce a new PID. Every probe defaults to this.
+ */
+#define DATACRUMBS_NEW_PID_SOURCE_NONE 0
+/**
+ * @brief The probed call returns the new PID (fork, vfork, clone, clone3).
+ */
+#define DATACRUMBS_NEW_PID_SOURCE_RETURN 1
+
+/**
  * @brief Composite key identifying a runtime function event.
  */
 struct fn_key_t {
@@ -85,6 +94,11 @@ struct fn_value_t {
 struct runtime_event_config_t {
   unsigned long long event_id;
   unsigned int probe_kind;
+  /// Where a newly created PID can be read from when this probe returns, as one
+  /// of the DATACRUMBS_NEW_PID_SOURCE_* values. Resolved once at load time from
+  /// the probe registry so the BPF exit path is a single integer test rather
+  /// than any name matching.
+  unsigned int new_pid_source;
   unsigned int arg_count;
   unsigned int arg_index[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_num_bytes[DATACRUMBS_MAX_CAPTURE_ARGS];

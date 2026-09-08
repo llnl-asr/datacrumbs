@@ -213,6 +213,35 @@ static inline __attribute__((always_inline)) void reset_captured_args(struct fn_
 /**
  * @brief Copy captured argument state into userspace event payload.
  */
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
+/**
+ * @brief Register a PID created by the probed call so tracing follows into it.
+ *
+ * Called from the exit path only when the load-time registry marked this probe
+ * as producing a PID, so the cost on every other probe is one integer compare.
+ * The caller has already established that the parent is being traced, which is
+ * what makes the child eligible.
+ *
+ * Adding another way of publishing a PID means adding a source value here and a
+ * matching registry entry in userspace; nothing else needs to change.
+ */
+static inline __attribute__((always_inline)) void track_new_pid(
+    struct pt_regs* ctx, const struct runtime_event_config_t* config) {
+  u32 new_pid = 0;
+  if (config->new_pid_source == DATACRUMBS_NEW_PID_SOURCE_RETURN) {
+    // fork/vfork/clone return the child PID to the parent and 0 in the child, so
+    // a zero return is the child's own view of the call and registers nothing.
+    new_pid = (u32)PT_REGS_RC(ctx);
+  }
+  if (new_pid == 0) {
+    return;
+  }
+  u64 tsp = bpf_ktime_get_ns();
+  bpf_map_update_elem(&pid_map, &new_pid, &tsp, BPF_ANY);
+  DBG_PRINTK("Tracing new pid %d created by event %llu\n", new_pid, config->event_id);
+}
+#endif
+
 static inline __attribute__((always_inline)) void copy_captured_args_to_event(
     const struct fn_value_t* fn, struct generic_event_t* event) {
   event->arg_count = fn->arg_count;
@@ -451,6 +480,13 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   }
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
+
+  // The parent is being traced, so a PID this call created is eligible too.
+  // One integer compare for probes that create nothing, which is nearly all.
+  if (config->new_pid_source != DATACRUMBS_NEW_PID_SOURCE_NONE) {
+    track_new_pid(ctx, config);
+  }
+
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
@@ -688,31 +724,6 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
 #else
 static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, u64 event_id,
                                                            long clazz, long method) {
-  return 0;
-}
-#endif
-
-#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
-static inline __attribute__((always_inline)) int generic_fork_exit(struct pt_regs* ctx,
-                                                                   u64 event_id) {
-  struct fn_key_t key = {};
-  key.event_id = event_id;
-  u64 start_ts;
-  if (need_tracing(&key, &start_ts)) {
-    u64 tsp = bpf_ktime_get_ns();
-    u32 pid = PT_REGS_RC(ctx);
-    (void)pid;
-    if (pid != 0) {
-      DBG_PRINTK("Collect forked tracing PID %d", pid);
-      bpf_map_update_elem(&pid_map, &pid, &tsp, BPF_ANY);
-    }
-  }
-  return generic_exit(ctx, event_id);
-}
-
-#else
-static inline __attribute__((always_inline)) int generic_fork_exit(struct pt_regs* ctx,
-                                                                   u64 event_id) {
   return 0;
 }
 #endif

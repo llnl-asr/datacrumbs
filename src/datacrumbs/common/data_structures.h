@@ -150,6 +150,11 @@ class Probe {
   std::vector<std::string> functions;  // List of functions or arguments for the probe
   std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
       function_arguments;  // Optional per-function runtime arg capture specification
+  /// Optional per-function declaration of where a newly created PID can be read
+  /// from, keyed by function name with a source name such as "return". Declared
+  /// in the user configuration and validated by the probe manager, so which
+  /// calls create processes is configuration rather than compiled-in knowledge.
+  std::unordered_map<std::string, std::string> new_pid_functions;
 
   // Validates the probe's configuration
   virtual bool validate() const {
@@ -195,6 +200,15 @@ class Probe {
       json_object_object_add(j, "function_arguments", jfunction_arguments);
     }
 
+    if (!new_pid_functions.empty()) {
+      json_object* jnew_pid = json_object_new_object();
+      for (const auto& [function_name, source] : new_pid_functions) {
+        json_object_object_add(jnew_pid, function_name.c_str(),
+                               json_object_new_string(source.c_str()));
+      }
+      json_object_object_add(j, "new_pid_functions", jnew_pid);
+    }
+
     return j;
   }
 
@@ -233,6 +247,16 @@ class Probe {
         p.function_arguments[function_name] = std::move(arg_specs);
       }
     }
+
+    json_object* new_pid_obj = json_object_object_get(j, "new_pid_functions");
+    if (new_pid_obj && json_object_get_type(new_pid_obj) == json_type_object) {
+      json_object_object_foreach(new_pid_obj, function_name, source_obj) {
+        if (!source_obj || json_object_get_type(source_obj) != json_type_string) {
+          continue;
+        }
+        p.new_pid_functions[function_name] = json_object_get_string(source_obj);
+      }
+    }
     return p;
   }
 
@@ -242,6 +266,19 @@ class Probe {
       return nullptr;
     }
     return &it->second;
+  }
+
+  /**
+   * @brief Name of the source a new PID can be read from for a function.
+   *
+   * @param function_name Function being attached. Example: "__x64_sys_clone3".
+   * @return Source name such as "return", or an empty string when this function
+   *         is not declared as creating a process.
+   */
+  const std::string& getNewPidSource(const std::string& function_name) const {
+    static const std::string kNone;
+    const auto it = new_pid_functions.find(function_name);
+    return it == new_pid_functions.end() ? kNone : it->second;
   }
 };
 

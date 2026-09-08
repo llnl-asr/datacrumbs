@@ -51,6 +51,15 @@ constexpr const char* kRequiredChecksumAlgorithm = "hmac-sha256";
  */
 constexpr int kMaxFunctionArguments = 64;
 
+/**
+ * @brief New-PID sources the runtime can actually read.
+ *
+ * Kept in step with DATACRUMBS_NEW_PID_SOURCE_* and the track_new_pid() cases;
+ * a source the runtime cannot read is rejected at signing rather than silently
+ * ignored at attach time.
+ */
+const std::unordered_set<std::string> kSupportedNewPidSources = {"return"};
+
 bool key_exists(const std::unordered_set<std::string>& keys, const std::string& key) {
   return keys.find(key) != keys.end();
 }
@@ -1035,7 +1044,7 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
       const auto probe_type = static_cast<datacrumbs::ProbeType>(probe_type_value);
 
       std::unordered_set<std::string> required_keys = {"type", "name", "functions"};
-      std::unordered_set<std::string> optional_keys = {"function_arguments"};
+      std::unordered_set<std::string> optional_keys = {"function_arguments", "new_pid_functions"};
       if (probe_type == datacrumbs::ProbeType::UPROBE) {
         required_keys.insert("binary_path");
         required_keys.insert("include_offsets");
@@ -1049,6 +1058,49 @@ bool ProbeManagerService::validate_signing_payload(const std::string& signing_pa
         required_keys.insert("event_type");
       }
       ok = validate_exact_keys(probe, required_keys, optional_keys, context, errors) && ok;
+
+      // Declaring that a function yields a new PID causes the root server to follow
+      // tracing into processes it creates, so the map is validated rather than
+      // passed through: keys must be functions this probe actually declares, and
+      // the source must be one the runtime knows how to read.
+      json_object* new_pid_obj = nullptr;
+      if (json_object_object_get_ex(probe, "new_pid_functions", &new_pid_obj)) {
+        if (json_object_get_type(new_pid_obj) != json_type_object) {
+          errors->push_back(context + ".new_pid_functions must be an object");
+          ok = false;
+        } else {
+          std::unordered_set<std::string> declared_functions;
+          json_object* declared_obj = nullptr;
+          if (json_object_object_get_ex(probe, "functions", &declared_obj) &&
+              json_object_get_type(declared_obj) == json_type_array) {
+            const int declared_count = json_object_array_length(declared_obj);
+            for (int f = 0; f < declared_count; ++f) {
+              json_object* entry = json_object_array_get_idx(declared_obj, f);
+              if (entry != nullptr && json_object_get_type(entry) == json_type_string) {
+                declared_functions.insert(json_object_get_string(entry));
+              }
+            }
+          }
+          json_object_object_foreach(new_pid_obj, pid_function, pid_source) {
+            const std::string pid_context =
+                context + ".new_pid_functions['" + std::string(pid_function) + "']";
+            if (pid_source == nullptr || json_object_get_type(pid_source) != json_type_string) {
+              errors->push_back(pid_context + " must be a string");
+              ok = false;
+              continue;
+            }
+            if (!key_exists(declared_functions, pid_function)) {
+              errors->push_back(pid_context + " names a function not declared in .functions");
+              ok = false;
+            }
+            const std::string source_name = json_object_get_string(pid_source);
+            if (!key_exists(kSupportedNewPidSources, source_name)) {
+              errors->push_back(pid_context + " has unsupported source '" + source_name + "'");
+              ok = false;
+            }
+          }
+        }
+      }
 
       if (!json_object_object_get_ex(probe, "name", &name_obj) ||
           json_object_get_type(name_obj) != json_type_string ||

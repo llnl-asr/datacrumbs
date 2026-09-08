@@ -7,6 +7,9 @@
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/server/process/event_processor.h>
 
+#include <unordered_map>
+#include <unordered_set>
+
 // std headers
 #include <algorithm>
 #include <cstdlib>
@@ -92,13 +95,42 @@ static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
   }
 }
 
+/**
+ * @brief Translate a configured new-PID source name into its BPF source id.
+ *
+ * Which calls create processes is declared in the user configuration, validated
+ * by the probe manager, and carried in the signed probe descriptor, so this is
+ * only the string-to-id mapping for the sources BPF knows how to read. Adding a
+ * source means adding a name here and a matching case in track_new_pid().
+ *
+ * @param source_name Source declared for the function. Example: "return".
+ * @return A DATACRUMBS_NEW_PID_SOURCE_* value; NONE when unset or unrecognised.
+ */
+static unsigned int new_pid_source_id(const std::string& source_name) {
+  if (source_name.empty()) {
+    return DATACRUMBS_NEW_PID_SOURCE_NONE;
+  }
+  if (source_name == "return") {
+    return DATACRUMBS_NEW_PID_SOURCE_RETURN;
+  }
+  DC_LOG_WARN("Unknown new-pid source '%s'; processes created here will not be traced",
+              source_name.c_str());
+  return DATACRUMBS_NEW_PID_SOURCE_NONE;
+}
+
 static int populate_event_arg_config(
     int map_fd, uint64_t cookie, uint64_t event_id, datacrumbs::ProbeType probe_type,
+    const std::string& function_name, const std::string& new_pid_source,
     const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs) {
   // Populate one compact per-event capture schema consumed directly by BPF programs.
   runtime_event_config_t config = {};
   config.event_id = event_id;
   config.probe_kind = runtime_probe_kind(probe_type);
+  config.new_pid_source = new_pid_source_id(new_pid_source);
+  if (config.new_pid_source != DATACRUMBS_NEW_PID_SOURCE_NONE) {
+    DC_LOG_DEBUG("Probe '%s' declared as creating processes via '%s'; children will be traced",
+                 function_name.c_str(), new_pid_source.c_str());
+  }
   if (arg_specs != nullptr) {
     config.arg_count = std::min<unsigned int>(arg_specs->size(), DATACRUMBS_MAX_CAPTURE_ARGS);
     for (unsigned int index = 0; index < config.arg_count; ++index) {
@@ -209,6 +241,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         // Attach entry+exit kprobes and track runtime state success/failure.
         total_requested += 2;
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      function_name, probe->getNewPidSource(function_name),
                                       probe->getArgSpecs(function_name)) != 0) {
           total_failed += 2;
           continue;
@@ -238,6 +271,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         total_requested += 2;
         const std::string syscall_name = normalize_syscall_name_for_attach(function_name);
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      function_name, probe->getNewPidSource(function_name),
                                       probe->getArgSpecs(function_name)) != 0) {
           total_failed += 2;
           continue;
@@ -276,6 +310,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
           continue;
         }
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      function_name, probe->getNewPidSource(function_name),
                                       probe->getArgSpecs(function_name)) != 0) {
           total_failed += 2;
           continue;
@@ -309,6 +344,7 @@ static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
         total_requested += 2;
         auto usdt = std::dynamic_pointer_cast<datacrumbs::USDTProbe>(probe);
         if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      function_name, probe->getNewPidSource(function_name),
                                       probe->getArgSpecs(function_name)) != 0) {
           total_failed += 2;
           continue;
