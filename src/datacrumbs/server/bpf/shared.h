@@ -39,6 +39,10 @@ struct generic_event_t {
   unsigned int arg_data_len[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned int arg_data_status[DATACRUMBS_MAX_CAPTURE_ARGS];
   unsigned char arg_data[DATACRUMBS_MAX_CAPTURE_ARGS][DATACRUMBS_MAX_CAPTURE_BYTES];
+  /// USDT class-name hash; zero for probe kinds that do not resolve a class.
+  unsigned int class_hash;
+  /// USDT method-name hash; zero for probe kinds that do not resolve a method.
+  unsigned int method_hash;
 };
 typedef struct generic_event_t general_event_t;
 /**

@@ -94,9 +94,15 @@ inline static int lookup_3(int map_fd, unsigned long long latest_timestamp,
  */
 static datacrumbs::EventWithId* get_data_3(void* data, uint64_t index) {
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-  struct usdt_event_t* base = (usdt_event_t*)data;
+  // Tracer mode emits generic_event_t for USDT probes, so decode it as such: the
+  // class/method hashes live past the argument-capture fields and would be
+  // unreachable through the shorter usdt_event_t view.
+  struct generic_event_t* base = (generic_event_t*)data;
+  auto args = new DataCrumbsArgs();
+  args->emplace("clazz", base->class_hash);
+  args->emplace("method", base->method_hash);
   auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
-                                           base->event_id, base->ts, base->dur, nullptr);
+                                           base->event_id, base->ts, base->dur, args);
 #else
   struct usdt_counter_event_t* base = (usdt_counter_event_t*)data;
   auto args = new DataCrumbsArgs();

@@ -457,6 +457,10 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   event->type = config->probe_kind;
   event->id = key.id;
   event->event_id = event_id;
+  // bpf_ringbuf_reserve does not zero the reservation, so fields only set by
+  // other probe kinds must be cleared explicitly rather than left as stale data.
+  event->class_hash = 0;
+  event->method_hash = 0;
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
@@ -593,11 +597,34 @@ static inline __attribute__((always_inline)) int usdt_exit(struct pt_regs* ctx, 
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+
+  // Resolve the class name before reserving ring-buffer space: the inclusion
+  // filter can reject the event, and a reservation taken first would have to be
+  // discarded. This mirrors the profiler-mode path so both modes identify and
+  // filter USDT probes the same way.
+  struct string_t local_str = {};
+  long len = bpf_probe_read_user_str(&local_str.str, MAX_STR_READ_LEN, (void*)clazz);
+  local_str.len = len * 8;
+
+#if defined(DATACRUMBS_ENABLE_INCLUSION_PATH) && (DATACRUMBS_ENABLE_INCLUSION_PATH == 1)
+  int found = prefix_search(&inclusion_path_trie, &local_str);
+  if (!found) {
+    DBG_PRINTK("Skipping usdt for %s as it is not in inclusion path trie\n", local_str.str);
+    return 0;  // Skip if not in inclusion path
+  }
+#endif
+
+  const u32 class_hash = hash_and_store(&local_str, len);
+  len = bpf_probe_read_user_str(&local_str.str, MAX_STR_READ_LEN, (void*)method);
+  const u32 method_hash = hash_and_store(&local_str, len);
+
   struct generic_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct generic_event_t, event);
   event->type = config->probe_kind;
   event->id = key.id;
   event->event_id = event_id;
+  event->class_hash = class_hash;
+  event->method_hash = method_hash;
   DATACRUMBS_COLLECT_TIME(event);
   copy_captured_args_to_event(fn, event);
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
