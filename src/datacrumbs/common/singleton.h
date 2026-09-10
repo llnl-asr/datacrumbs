@@ -1,6 +1,5 @@
-//
-// Created by haridev on 3/28/23.
-//
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
 
 #pragma once
 // include first
@@ -15,19 +14,18 @@
 namespace datacrumbs {
 
 /**
- * @brief Singleton class template to ensure a single instance of T.
+ * @brief Generic lazy singleton holder for shared ownership use-cases.
  *
- * Uses a shared pointer to manage the instance. Logging is provided using
- * printf-style macros from datacrumbs/common/logging.h.
+ * @tparam T Singleton target type.
  */
 template <typename T>
 class Singleton {
  public:
   /**
-   * @brief Get the singleton instance of T.
-   *
-   * If instance creation is stopped, returns nullptr.
-   * Logs function entry/exit and instance creation.
+   * @brief Get or create singleton instance.
+   * @tparam Args Constructor argument types for T.
+   * @param args Constructor arguments forwarded to T when first created.
+   * @return Shared pointer to singleton instance; nullptr if finalized.
    */
   template <typename... Args>
   static std::shared_ptr<T> get_instance(Args... args) {
@@ -47,20 +45,11 @@ class Singleton {
     return instance;
   }
 
-  /**
-   * @brief Deleted assignment operator.
-   */
   Singleton& operator=(const Singleton) = delete;
-
-  /**
-   * @brief Deleted copy constructor.
-   */
   Singleton(const Singleton&) = delete;
 
   /**
-   * @brief Finalize the singleton, preventing further instance creation.
-   *
-   * Logs the finalization event.
+   * @brief Mark singleton as finalized and prevent further creation.
    */
   static void finalize() {
     DC_LOG_INFO("Finalizing Singleton<%s>, no further instances will be created", typeid(T).name());
@@ -68,12 +57,11 @@ class Singleton {
   }
 
  protected:
-  static bool stop_creating_instances;  ///< Flag to stop instance creation
-  static std::shared_ptr<T> instance;   ///< Singleton instance
+  /// Prevents new instance creation after finalize().
+  static bool stop_creating_instances;
+  /// Shared singleton instance.
+  static std::shared_ptr<T> instance;
 
-  /**
-   * @brief Hidden default constructor.
-   */
   Singleton() {}
 };
 

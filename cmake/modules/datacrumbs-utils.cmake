@@ -18,17 +18,28 @@ macro(include_dependencies)
   message(STATUS "[${UPPER_PROJECT_NAME}] Detecting dependencies")
 
   # find packages
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(LIBBPF libbpf)
-  find_package(yaml-cpp REQUIRED)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    execute_process(
+      COMMAND ${PKG_CONFIG_EXECUTABLE} --version
+      RESULT_VARIABLE _DATACRUMBS_PKGCONFIG_RESULT
+      OUTPUT_QUIET ERROR_QUIET
+    )
+    if(_DATACRUMBS_PKGCONFIG_RESULT EQUAL 0)
+      pkg_check_modules(LIBBPF QUIET libbpf)
+    else()
+      message(
+        WARNING
+          "[${UPPER_PROJECT_NAME}] pkg-config is present but not executable; falling back to direct libbpf lookup"
+      )
+      set(PkgConfig_FOUND FALSE)
+    endif()
+  endif()
   find_package(LLVM REQUIRED CONFIG COMPONENTS Clang)
   find_package(json-c REQUIRED)
+  find_package(OpenSSL REQUIRED)
+  find_package(SQLite3 REQUIRED)
   find_package(ZLIB REQUIRED)
-  find_package(
-    MPI REQUIRED
-    COMPONENTS CXX
-    QUIET
-  )
 
   # all validator
   if(LIBBPF_VERSION VERSION_LESS "1.0.0")
@@ -64,27 +75,34 @@ macro(include_dependencies)
         -lelf
     )
   else()
-    message(FATAL_ERROR "[${UPPER_PROJECT_NAME}] libbpf not found!")
-  endif()
-
-  if(${yaml-cpp_FOUND})
-    get_filename_component(YAML_CPP_INCLUDE_DIR "${YAML_CPP_INCLUDE_DIR}" ABSOLUTE)
-    include_directories(${YAML_CPP_INCLUDE_DIR})
-
-    if(NOT DEFINED YAML_CPP_LIBRARY_DIR)
-      get_filename_component(YAML_CPP_LIBRARY_DIR "${YAML_CPP_CMAKE_DIR}/../../" ABSOLUTE)
-      get_filename_component(YAML_CPP_LIBRARY_DIR "${YAML_CPP_LIBRARY_DIR}" ABSOLUTE)
+    find_path(LIBBPF_INCLUDEDIR bpf/libbpf.h)
+    find_library(LIBBPF_LIBRARY bpf)
+    find_library(LIBELF_LIBRARY elf)
+    if(LIBBPF_INCLUDEDIR
+       AND LIBBPF_LIBRARY
+       AND LIBELF_LIBRARY
+    )
+      get_filename_component(LIBBPF_LIBRARY_DIRS "${LIBBPF_LIBRARY}" DIRECTORY)
+      include_directories(${LIBBPF_INCLUDEDIR})
+      link_directories(${LIBBPF_LIBRARY_DIRS})
+      list(APPEND DEPENDENCY_LIBRARY_DIRS ${LIBBPF_LIBRARY_DIRS})
+      set(DEPENDENCY_LIB
+          ${DEPENDENCY_LIB}
+          -L${LIBBPF_LIBRARY_DIRS}
+          -lbpf
+          -lelf
+      )
+      set(LIBBPF_FOUND TRUE)
+      set(LIBBPF_VERSION "unknown")
+    else()
+      message(FATAL_ERROR "[${UPPER_PROJECT_NAME}] libbpf not found!")
     endif()
-
-    list(APPEND DEPENDENCY_LIBRARY_DIRS ${YAML_CPP_LIBRARY_DIR})
-    set(DEPENDENCY_LIB ${DEPENDENCY_LIB} -L${YAML_CPP_LIBRARY_DIR} -lyaml-cpp)
-  else()
-    message(FATAL_ERROR "-- [${UPPER_PROJECT_NAME}] yaml-cpp is needed for ${PROJECT_NAME} build")
   endif()
 
   if(LLVM_FOUND)
     include_directories(${LLVM_INCLUDE_DIRS})
     link_directories(${LLVM_LIBRARY_DIRS})
+    list(APPEND DEPENDENCY_LIBRARY_DIRS ${LLVM_LIBRARY_DIRS})
     set(DEPENDENCY_LIB ${DEPENDENCY_LIB} ${LLVM_LIBRARIES} -lclang)
     set(CLANG_EXECUTABLE ${LLVM_TOOLS_BINARY_DIR}/clang)
 
@@ -120,6 +138,20 @@ macro(include_dependencies)
     message(FATAL_ERROR "-- [${UPPER_PROJECT_NAME}] json-c is needed for ${PROJECT_NAME} build")
   endif()
 
+  if(OpenSSL_FOUND)
+    include_directories(${OPENSSL_INCLUDE_DIR})
+    set(DEPENDENCY_LIB ${DEPENDENCY_LIB} OpenSSL::Crypto)
+  else()
+    message(FATAL_ERROR "-- [${UPPER_PROJECT_NAME}] OpenSSL is needed for ${PROJECT_NAME} build")
+  endif()
+
+  if(SQLite3_FOUND)
+    include_directories(${SQLite3_INCLUDE_DIRS})
+    set(DEPENDENCY_LIB ${DEPENDENCY_LIB} SQLite::SQLite3)
+  else()
+    message(FATAL_ERROR "-- [${UPPER_PROJECT_NAME}] SQLite3 is needed for ${PROJECT_NAME} build")
+  endif()
+
   if(ZLIB_FOUND)
     include_directories(${ZLIB_INCLUDE_DIRS})
     get_filename_component(ZLIB_LIBRARY_DIRS "${ZLIB_LIBRARIES}/../" ABSOLUTE)
@@ -127,35 +159,6 @@ macro(include_dependencies)
     set(DEPENDENCY_LIB ${DEPENDENCY_LIB} -lz)
   else()
     message(FATAL_ERROR "-- [${UPPER_PROJECT_NAME}] zlib is needed for ${PROJECT_NAME} build")
-  endif()
-
-  if(${MPI_CXX_FOUND})
-    # MPI_CXX_FOUND MPI_CXX_VERSION MPI_CXX_INCLUDE_DIRS MPI_CXX_LIBRARIES
-    get_filename_component(MPI_CXX_INCLUDE_DIRS "${MPI_CXX_INCLUDE_DIRS}" ABSOLUTE)
-    include_directories(${MPI_CXX_INCLUDE_DIRS})
-
-    if(NOT DEFINED MPI_CXX_LIBRARY_DIR)
-      if(MPI_CXX_LIBRARIES)
-        # If MPI_CXX_LIBRARIES is a list, get parent dir of each library
-        set(MPI_CXX_LIBRARY_DIR "")
-
-        foreach(_lib ${MPI_CXX_LIBRARIES})
-          get_filename_component(_lib_dir "${_lib}" DIRECTORY)
-          get_filename_component(_lib_dir "${_lib_dir}" ABSOLUTE)
-          list(APPEND MPI_CXX_LIBRARY_DIR "${_lib_dir}")
-        endforeach()
-
-        list(REMOVE_DUPLICATES MPI_CXX_LIBRARY_DIR)
-      else()
-        get_filename_component(MPI_CXX_LIBRARY_DIR "${MPI_CXX_LIBRARIES}" DIRECTORY)
-        set(MPI_CXX_LIBRARY_DIR "${MPI_CXX_LIBRARY_DIR}")
-      endif()
-    endif()
-
-    list(APPEND DEPENDENCY_LIBRARY_DIRS ${MPI_CXX_LIBRARY_DIR})
-    set(DEPENDENCY_LIB ${DEPENDENCY_LIB} -L${MPI_CXX_LIBRARY_DIR} ${MPI_CXX_LIBRARIES})
-  else()
-    message(FATAL_ERROR "-- [${UPPER_PROJECT_NAME}] mpi is needed for ${PROJECT_NAME} build")
   endif()
 
   list(APPEND DEPENDENCY_LIBRARY_DIRS ${DATACRUMBS_INSTALL_LIB_DIR})
@@ -168,10 +171,6 @@ macro(include_dependencies)
   )
   message(
     STATUS
-      "             - Found yaml-cpp:${yaml-cpp_VERSION} at include:${YAML_CPP_INCLUDE_DIR} lib:${YAML_CPP_LIBRARY_DIR}"
-  )
-  message(
-    STATUS
       "             - Found llvm:${LLVM_VERSION} at include:${LLVM_INCLUDE_DIRS} lib:${LLVM_LIBRARY_DIRS} clang:${CLANG_EXECUTABLE}"
   )
   message(
@@ -179,12 +178,11 @@ macro(include_dependencies)
       "             - Found json-c:${json-c_CONSIDERED_VERSIONS} at include:${json-c_INCLUDE_DIR} lib:${json-c_LIBRARY_DIR}"
   )
   message(
-    STATUS
-      "             - Found zlib:${ZLIB_VERSION} at include:${ZLIB_INCLUDE_DIRS} lib:${ZLIB_LIBRARY_DIRS}"
+    STATUS "             - Found sqlite3:${SQLite3_VERSION} at include:${SQLite3_INCLUDE_DIRS}"
   )
   message(
     STATUS
-      "             - Found mpi:${MPI_CXX_VERSION} at include:${MPI_CXX_INCLUDE_DIRS} lib:${MPI_CXX_LIBRARY_DIR}"
+      "             - Found zlib:${ZLIB_VERSION} at include:${ZLIB_INCLUDE_DIRS} lib:${ZLIB_LIBRARY_DIRS}"
   )
   message(STATUS "             - DEPENDENCY_LIBRARY_DIRS for RPATH:${DEPENDENCY_LIBRARY_DIRS}")
   message(STATUS "             - DEPENDENCY_LIB for linking :${DEPENDENCY_LIB}")
@@ -194,6 +192,7 @@ macro(include_dependencies)
             DEPENDENCY_LIBRARY_DIRS_COLON
             "${DEPENDENCY_LIBRARY_DIRS}"
   )
+  set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
   set(CMAKE_INSTALL_RPATH "${DEPENDENCY_LIBRARY_DIRS}")
   set(CMAKE_BUILD_RPATH "${DEPENDENCY_LIBRARY_DIRS}")
 
@@ -237,18 +236,6 @@ macro(derive_configurations)
     set(BPFTOOL_EXECUTABLE "")
   endif()
 
-  if(NOT DATACRUMBS_SKIP_PROBE_EXPLORING)
-    set(ENABLE_PROBE_EXPLORER 1)
-  else()
-    set(ENABLE_PROBE_EXPLORER 0)
-  endif()
-
-  if(NOT DATACRUMBS_SKIP_PROBE_GENERATION)
-    set(ENABLE_PROBE_GENERATOR 1)
-  else()
-    set(ENABLE_PROBE_GENERATOR 0)
-  endif()
-
   if(DATACRUMBS_INCLUSION_PATH STREQUAL "NONE")
     set(DATACRUMBS_ENABLE_INCLUSION_PATH 0)
   else()
@@ -262,15 +249,28 @@ macro(derive_configurations)
   endif()
 
   set(DATACRUMBS_SRC_GEN_PATH ${CMAKE_LIBEXEC_OUTPUT_DIRECTORY})
+  if(DATACRUMBS_CONFIGURED_LOG_DIR
+     AND NOT
+         DATACRUMBS_CONFIGURED_LOG_DIR
+         STREQUAL
+         ""
+     AND NOT
+         DATACRUMBS_CONFIGURED_LOG_DIR
+         STREQUAL
+         "NONE"
+  )
+    set(DATACRUMBS_LOG_DIR ${DATACRUMBS_CONFIGURED_LOG_DIR})
+  else()
+    set(DATACRUMBS_LOG_DIR ${CMAKE_BINARY_DIR}/logs)
+  endif()
+
   set(DATACRUMBS_VARS
       --user
       ${DATACRUMBS_USER}
-      --config_path
-      ${CMAKE_CONFIG_OUTPUT_DIRECTORY}
       --data_dir
       ${CMAKE_DATA_OUTPUT_DIRECTORY}
       --trace_log_dir
-      ${CMAKE_BINARY_DIR}/logs
+      ${DATACRUMBS_LOG_DIR}
   )
 
   if(NOT
@@ -281,11 +281,7 @@ macro(derive_configurations)
     set(DATACRUMBS_VARS ${DATACRUMBS_VARS} --inclusion_path ${DATACRUMBS_INCLUSION_PATH})
   endif()
 
-  set(DATACRUMBS_BUILD_CLIENT_SO ${DATACRUMBS_INSTALL_LIB_DIR}/libdatacrumbs_client.so)
-
-  set(DATACRUMBS_CONFIG_PATH ${CMAKE_CONFIG_OUTPUT_DIRECTORY})
   set(DATACRUMBS_DATA_DIR ${CMAKE_DATA_OUTPUT_DIRECTORY})
-  set(DATACRUMBS_LOG_DIR ${CMAKE_BINARY_DIR}/logs)
   file(MAKE_DIRECTORY ${DATACRUMBS_LOG_DIR})
 
   if(DATACRUMBS_ENABLE_OPT AND DATACRUMBS_ENABLE_OPT STREQUAL "ON")
@@ -294,7 +290,9 @@ macro(derive_configurations)
     set(DATACRUMBS_ENABLE 0)
   endif()
 
-  set(DATACRUMBS_PROJECT_PATH ${CMAKE_CURRENT_SOURCE_DIR})
+  if(NOT DEFINED DATACRUMBS_PROJECT_PATH OR DATACRUMBS_PROJECT_PATH STREQUAL "")
+    set(DATACRUMBS_PROJECT_PATH ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
 
   # Detect system kernel version: major, minor, patch
   execute_process(
@@ -343,57 +341,22 @@ macro(derive_configurations)
       "(${KERNEL_VERSION_MAJOR}, ${KERNEL_VERSION_MINOR}, ${KERNEL_VERSION_PATCH})"
   )
 
-  # Set Scheduler options Check if scheduler configuration is complete
-  if((DATACRUMBS_SCHEDULER_JOBID_ENV_VAR STREQUAL "NONE"
-      OR DATACRUMBS_SCHEDULER_NODES_CMD_OPT STREQUAL "NONE"
-      OR DATACRUMBS_SCHEDULER_PPN_CMD_OPT STREQUAL "NONE"
-      OR DATACRUMBS_SCHEDULER_RUN_CMD STREQUAL "NONE"
-     )
-     AND DATACRUMBS_LAUNCHER_TYPE STREQUAL "NONE"
+  if(DATACRUMBS_SCHEDULER_JOBID_ENV_VAR STREQUAL "NONE" AND DATACRUMBS_SCHEDULER_TYPE STREQUAL
+                                                            "NONE"
   )
     message(
       FATAL_ERROR
-        "[${UPPER_PROJECT_NAME}] Incomplete scheduler configuration. Either use a predefined scheduler option by setting DATACRUMBS_LAUNCHER_TYPE, or set all of the following variables: DATACRUMBS_SCHEDULER_ALLOC_CMD, DATACRUMBS_SCHEDULER_JOBID_ENV_VAR, DATACRUMBS_SCHEDULER_NODES_CMD_OPT, DATACRUMBS_SCHEDULER_PPN_CMD_OPT, DATACRUMBS_SCHEDULER_RUN_CMD"
+        "[${UPPER_PROJECT_NAME}] Incomplete scheduler configuration. Either use a predefined scheduler option by setting DATACRUMBS_SCHEDULER_TYPE, or set DATACRUMBS_SCHEDULER_JOBID_ENV_VAR"
     )
   endif()
 
   if(DATACRUMBS_SCHEDULER_JOBID_ENV_VAR STREQUAL "NONE")
-    if(DATACRUMBS_LAUNCHER_TYPE STREQUAL "SLURM")
+    if(DATACRUMBS_SCHEDULER_TYPE STREQUAL "SLURM")
       set(DATACRUMBS_SCHEDULER_JOBID_ENV_VAR "SLURM_JOB_ID")
-    elseif(DATACRUMBS_LAUNCHER_TYPE STREQUAL "OPENMPI")
+    elseif(DATACRUMBS_SCHEDULER_TYPE STREQUAL "OPENMPI")
       set(DATACRUMBS_SCHEDULER_JOBID_ENV_VAR "OMPI_COMM_WORLD_RANK")
-    elseif(DATACRUMBS_LAUNCHER_TYPE STREQUAL "FLUX")
+    elseif(DATACRUMBS_SCHEDULER_TYPE STREQUAL "FLUX")
       set(DATACRUMBS_SCHEDULER_JOBID_ENV_VAR "FLUX_JOB_ID")
-    endif()
-  endif()
-
-  if(DATACRUMBS_SCHEDULER_NODES_CMD_OPT STREQUAL "NONE")
-    if(DATACRUMBS_LAUNCHER_TYPE STREQUAL "SLURM")
-      set(DATACRUMBS_SCHEDULER_NODES_CMD_OPT "-N")
-    elseif(DATACRUMBS_LAUNCHER_TYPE STREQUAL "OPENMPI")
-      set(DATACRUMBS_SCHEDULER_NODES_CMD_OPT "-N")
-    elseif(DATACRUMBS_LAUNCHER_TYPE STREQUAL "FLUX")
-      set(DATACRUMBS_SCHEDULER_NODES_CMD_OPT "-N")
-    endif()
-  endif()
-
-  if(DATACRUMBS_SCHEDULER_PPN_CMD_OPT STREQUAL "NONE")
-    if(DATACRUMBS_LAUNCHER_TYPE STREQUAL "SLURM")
-      set(DATACRUMBS_SCHEDULER_PPN_CMD_OPT "--ntasks-per-node")
-    elseif(DATACRUMBS_LAUNCHER_TYPE STREQUAL "OPENMPI")
-      set(DATACRUMBS_SCHEDULER_PPN_CMD_OPT "--map-by ppr:")
-    elseif(DATACRUMBS_LAUNCHER_TYPE STREQUAL "FLUX")
-      set(DATACRUMBS_SCHEDULER_PPN_CMD_OPT "--tasks-per-node")
-    endif()
-  endif()
-
-  if(DATACRUMBS_SCHEDULER_RUN_CMD STREQUAL "NONE")
-    if(DATACRUMBS_LAUNCHER_TYPE STREQUAL "SLURM")
-      set(DATACRUMBS_SCHEDULER_RUN_CMD "srun")
-    elseif(DATACRUMBS_LAUNCHER_TYPE STREQUAL "OPENMPI")
-      set(DATACRUMBS_SCHEDULER_RUN_CMD "mpirun")
-    elseif(DATACRUMBS_LAUNCHER_TYPE STREQUAL "FLUX")
-      set(DATACRUMBS_SCHEDULER_RUN_CMD "flux run")
     endif()
   endif()
 
@@ -585,36 +548,58 @@ function(datacrumbs_composable_install_src public_src)
 endfunction()
 
 macro(load_build_variables)
-  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY
-      ${CMAKE_BINARY_DIR}/bin
-      CACHE PATH "Single Directory for all Executables."
-  )
-  set(CMAKE_INCLUDE_OUTPUT_DIRECTORY
-      ${CMAKE_BINARY_DIR}/include
-      CACHE PATH "Store the headers."
-  )
-  set(CMAKE_CONFIG_OUTPUT_DIRECTORY
-      ${CMAKE_BINARY_DIR}/configs
-      CACHE PATH "Store the configuration generated."
-  )
-  set(CMAKE_DATA_OUTPUT_DIRECTORY
-      ${CMAKE_BINARY_DIR}/data
-      CACHE PATH "Store the data generated."
-  )
+  if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY
+        ${CMAKE_BINARY_DIR}/bin
+        CACHE PATH "Single Directory for all Executables."
+    )
+  endif()
+  if(NOT CMAKE_INCLUDE_OUTPUT_DIRECTORY)
+    set(CMAKE_INCLUDE_OUTPUT_DIRECTORY
+        ${CMAKE_BINARY_DIR}/include
+        CACHE PATH "Store the headers."
+    )
+  endif()
+  if(NOT CMAKE_CONFIG_OUTPUT_DIRECTORY)
+    set(CMAKE_CONFIG_OUTPUT_DIRECTORY
+        ${CMAKE_BINARY_DIR}/configs
+        CACHE PATH "Store the configuration generated."
+    )
+  endif()
+  if(NOT CMAKE_DATA_OUTPUT_DIRECTORY)
+    set(CMAKE_DATA_OUTPUT_DIRECTORY
+        ${CMAKE_BINARY_DIR}/data
+        CACHE PATH "Store the data generated."
+    )
+  endif()
   set(EXECUTABLE_OUTPUT_PATH ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
-  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY
-      ${CMAKE_BINARY_DIR}/${DATACRUMBS_LIBDIR}
-      CACHE PATH "Single Directory for all Libraries"
-  )
-  set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY
-      ${CMAKE_BINARY_DIR}/${DATACRUMBS_LIBDIR}
-      CACHE PATH "Single Directory for all static libraries."
-  )
-  set(CMAKE_LIBEXEC_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/libexec/${PROJECT_NAME})
-  set(CMAKE_ETC_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/etc/${PROJECT_NAME})
-  set(CMAKE_MODULES_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/etc/${PROJECT_NAME}/modulefiles)
-  set(CMAKE_FLUX_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/etc/${PROJECT_NAME}/flux)
-  set(CMAKE_SYSTEMD_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/etc/${PROJECT_NAME}/systemd)
+  if(NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY
+        ${CMAKE_BINARY_DIR}/${DATACRUMBS_LIBDIR}
+        CACHE PATH "Single Directory for all Libraries"
+    )
+  endif()
+  if(NOT CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY
+        ${CMAKE_BINARY_DIR}/${DATACRUMBS_LIBDIR}
+        CACHE PATH "Single Directory for all static libraries."
+    )
+  endif()
+  if(NOT CMAKE_LIBEXEC_OUTPUT_DIRECTORY)
+    set(CMAKE_LIBEXEC_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/libexec/${PROJECT_NAME})
+  endif()
+  if(NOT CMAKE_ETC_OUTPUT_DIRECTORY)
+    set(CMAKE_ETC_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/etc/${PROJECT_NAME})
+  endif()
+  if(NOT CMAKE_MODULES_OUTPUT_DIRECTORY)
+    set(CMAKE_MODULES_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/etc/${PROJECT_NAME}/modulefiles)
+  endif()
+  if(NOT CMAKE_FLUX_OUTPUT_DIRECTORY)
+    set(CMAKE_FLUX_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/etc/${PROJECT_NAME}/flux)
+  endif()
+  if(NOT CMAKE_SYSTEMD_OUTPUT_DIRECTORY)
+    set(CMAKE_SYSTEMD_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/etc/${PROJECT_NAME}/systemd)
+  endif()
 
   if(NOT DATACRUMBS_BUILD_ONLY)
     # Get installation directories -- these get used in various places; best to just make them

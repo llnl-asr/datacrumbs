@@ -1,4 +1,5 @@
-// main init
-#include "init.bpf.c"
-// generated file
-#include <datacrumbs/server/bpf/generated.bpf.c>
+// generic runtime probe handlers
+#include "generic.bpf.c"
+
+// site-local custom probes are wired through the generated aggregator header.
+#include <custom_probes.h>

@@ -1,0 +1,10 @@
+#ifndef DATACRUMBS_CUSTOM_PROBES_H
+#define DATACRUMBS_CUSTOM_PROBES_H
+
+/*
+ * Site-local custom BPF probes that can be enabled by uncommenting the
+ * generated includes below.
+ */
+// #include "@CMAKE_CURRENT_SOURCE_DIR@/etc/datacrumbs/plugins/custom_probes/sys_io/sysio.bpf.c"
+
+#endif

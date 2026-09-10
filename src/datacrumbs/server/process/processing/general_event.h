@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #pragma once
 
 // BPF Headers
@@ -6,7 +9,6 @@
 // Generated Headers
 #include <datacrumbs/datacrumbs_config.h>
 // other headers
-#include <datacrumbs/common/configuration_manager.h>
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/data_structures.h>
 #include <datacrumbs/common/logging.h>  // Logging header
@@ -50,6 +52,7 @@ inline static int lookup_1(int map_fd, unsigned long long latest_timestamp,
                            datacrumbs::EventProcessor* event_processor, unsigned int batch_size,
                            struct profile_key_t* keys, struct profile_value_t* values,
                            struct profile_key_t* in_batch) {
+  // Batch-read profiler map entries, emit events, then delete consumed keys.
   int ret = bpf_map_lookup_batch(map_fd, in_batch, &in_batch, keys, values, &batch_size, 0);
   if (ret < 0 && errno != ENOENT) {
     perror("bpf_map_lookup_batch general");
@@ -82,9 +85,16 @@ inline static int lookup_1(int map_fd, unsigned long long latest_timestamp,
 }
 
 #endif
+
+/**
+ * @brief Convert raw BPF general/counter payload into EventWithId wrapper.
+ * @param data Raw event payload from ring buffer or map lookup.
+ * @param index Monotonic event index.
+ * @return Newly allocated EventWithId.
+ */
 static datacrumbs::EventWithId* get_data_1(void* data, uint64_t index) {
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-  struct general_event_t* base = (general_event_t*)data;
+  general_event_t* base = (general_event_t*)data;
 
   auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
                                            base->event_id, base->ts, base->dur, nullptr);

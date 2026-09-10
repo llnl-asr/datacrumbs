@@ -1,20 +1,21 @@
 [Unit]
-Description=Datacrumbs Service for composite: %I
+Description=Datacrumbs Service run-id=%i
 After=network.target
 
 [Service]
-Type=forking
-ExecStart=@DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs_server_run.sh --verbose
-ExecStop=@DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs_server_stop.sh --verbose
+Type=simple
 User=root
-# Optional:
-RemainAfterExit=no
-# Copy PIDFile path to project yaml
-PIDFile=@DATACRUMBS_INSTALL_RUNSTATEDIR@/@PROJECT_NAME@/datacrumbs-systemd-%i.pid
-TimeoutStartSec=10min 
-TimeoutStopSec=5min 
-# Copy ENVFile path to project yaml
-EnvironmentFile=@DATACRUMBS_INSTALL_RUNSTATEDIR@/@PROJECT_NAME@/datacrumbs-%i.env
+EnvironmentFile=-@DATACRUMBS_SERVER_RUN_DIR@/datacrumbs-%i.env
+ExecStartPre=/usr/bin/rm -f @DATACRUMBS_SERVER_RUN_DIR@/datacrumbs-%i.ready
+ExecStartPre=/bin/sh -c 'mkdir -p "${DATACRUMBS_LOG_DIR}"'
+ExecStartPre=/bin/sh -c 'log_file="${DATACRUMBS_LOG_DIR}/datacrumbs_${DATACRUMBS_USER}_${DATACRUMBS_SERVICE_RUN_ID}_$$(hostname).log"; touch "$${log_file}" && chown "${DATACRUMBS_USER}":"${DATACRUMBS_USER}" "$${log_file}" && chmod 0660 "$${log_file}"'
+ExecStart=/bin/sh -c 'exec @DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs "${DATACRUMBS_PROBE_FILE}" "%i" "${DATACRUMBS_USER}" >> "${DATACRUMBS_LOG_DIR}/datacrumbs_${DATACRUMBS_USER}_${DATACRUMBS_SERVICE_RUN_ID}_$$(hostname).log" 2>&1'
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 300); do [ -f "@DATACRUMBS_SERVER_RUN_DIR@/datacrumbs-%i.ready" ] && exit 0; sleep 1; done; exit 1'
+ExecStop=/bin/kill -INT $MAINPID
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStartSec=10min
+TimeoutStopSec=10min
 
 [Install]
 WantedBy=multi-user.target

@@ -1,12 +1,11 @@
 #!/bin/bash
 
-set -e pipefail
+set -eo pipefail
 
-source @DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs_service_common.sh
-if [[ $? -eq 0 ]]; then
+if source @DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs_service_common.sh; then
   umask 022
-  printenv >/run/datacrumbs.env
-  echo datacrumbs_service_run "Starting datacrumbs service run script on job ${DATACRUMBS_SERVER_RUN_ID}"
-  sudo systemctl start datacrumbs@${DATACRUMBS_SERVER_RUN_ID}.service
+  write_service_env_file "${DATACRUMBS_SERVICE_ENV_FILE}" "${DATACRUMBS_PROBE_FILE}"
+  log_system "Starting datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service with ${DATACRUMBS_PROBE_FILE}"
+  systemctl_cmd enable --now "datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service"
 fi
 exit 0

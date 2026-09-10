@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #pragma once
 
 // BPF Headers
@@ -6,7 +9,6 @@
 // Generated Headers
 #include <datacrumbs/datacrumbs_config.h>
 // other headers
-#include <datacrumbs/common/configuration_manager.h>
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/data_structures.h>
 #include <datacrumbs/common/logging.h>  // Logging header
@@ -51,6 +53,7 @@ inline static int lookup_3(int map_fd, unsigned long long latest_timestamp,
                            datacrumbs::EventProcessor* event_processor, unsigned int batch_size,
                            struct usdt_profile_key_t* keys, struct profile_value_t* values,
                            struct usdt_profile_key_t* in_batch) {
+  // Batch-read USDT profiler map entries, emit events, then remove processed keys.
   int ret = bpf_map_lookup_batch(map_fd, in_batch, &in_batch, keys, values, &batch_size, 0);
   if (ret < 0 && errno != ENOENT) {
     perror("bpf_map_lookup_batch usdt");
@@ -83,9 +86,18 @@ inline static int lookup_3(int map_fd, unsigned long long latest_timestamp,
 }
 #endif
 
+/**
+ * @brief Convert raw USDT payload into EventWithId wrapper.
+ * @param data Raw USDT event payload.
+ * @param index Monotonic event index.
+ * @return Newly allocated EventWithId.
+ */
 static datacrumbs::EventWithId* get_data_3(void* data, uint64_t index) {
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-  struct usdt_event_t* base = (usdt_event_t*)data;
+  // Tracer mode emits generic_event_t for USDT probes, so decode it as such: the
+  // class/method hashes live past the argument-capture fields and would be
+  // unreachable through the shorter usdt_event_t view.
+  struct generic_event_t* base = (generic_event_t*)data;
   auto args = new DataCrumbsArgs();
   args->emplace("clazz", base->class_hash);
   args->emplace("method", base->method_hash);

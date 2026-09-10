@@ -11,6 +11,14 @@
 
 DATACRUMBS_MAP(pid_map, u32, u64, 1024);
 DATACRUMBS_MAP(fn_pid_map, struct fn_key_t, struct fn_value_t);
+DATACRUMBS_MAP(event_arg_config_map, u64, struct runtime_event_config_t,
+               DATACRUMBS_MAX_RUNTIME_FUNCTIONS);
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct fn_value_t);
+} scratch_fn_value_map SEC(".maps");
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
 DATACRUMBS_MAP(failed_request, u32, u32, 128);

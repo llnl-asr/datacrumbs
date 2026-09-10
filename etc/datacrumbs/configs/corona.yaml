@@ -1,6 +1,0 @@
-capture_probes:
-  - name: sys
-    probe: syscalls
-    type: header
-    file: /usr/src/kernels/@DATACRUMBS_KERNEL_UNAME_R@/include/linux/syscalls.h
-    regex: sys_.*

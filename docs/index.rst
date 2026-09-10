@@ -1,15 +1,17 @@
-.. DataCrumbs documentation master file, created by
-   sphinx-quickstart on Sun Nov 26 20:15:18 2017.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
-
 ===============================================================================
 DataCrumbs: eBPF-based I/O Profiling and Tracing for HPC Applications
 ===============================================================================
 
-DataCrumbs is a comprehensive I/O profiling and tracing tool designed for high-performance computing (HPC) environments. 
-It leverages eBPF (extended Berkeley Packet Filter) technology to provide low-overhead, real-time monitoring and 
-analysis of application I/O behavior at scale.
+DataCrumbs is the runtime side of the DataCrumbs stack. It loads signed probe
+descriptions, attaches generic BPF programs to runtime-selected functions, and
+writes DFTracer output.
+
+The current split is:
+
+- `datacrumbs`: runtime daemon, BPF programs, system configuration generation,
+  and scheduler service integration
+- `datacrumbs-utils`: probe builder, client library, wrappers, tests, and
+  developer tooling
 
 .. toctree::
    :maxdepth: 2
@@ -21,28 +23,24 @@ analysis of application I/O behavior at scale.
 
 .. toctree::
    :maxdepth: 2
-   :caption: Building and Setup
+   :caption: Build and Operation
 
    build
    setup
-
-.. toctree::
-   :maxdepth: 2
-   :caption: User Guide
-
    usage
    integration
-   composability
+   run
 
 .. toctree::
    :maxdepth: 2
-   :caption: Advanced Topics
+   :caption: Scheduler Integration
 
    flux_integration
+   slurm_integration
 
 .. toctree::
    :maxdepth: 2
-   :caption: Legacy Documentation
+   :caption: Legacy Notes
 
    overview
 
@@ -53,4 +51,3 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
-

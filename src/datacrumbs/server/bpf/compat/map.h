@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #ifndef DATACRUMBS_SERVER_BPF_COMPAT_H
 #define DATACRUMBS_SERVER_BPF_COMPAT_H
 // Configuration
@@ -16,6 +19,10 @@
 /* Forward declaration for the batch options struct. */
 struct bpf_map_batch_opts;
 
+/**
+ * @brief Compatibility implementation of lookup-and-delete batch map API.
+ * @return 1 when batch filled and more entries may remain, -1 on ENOENT/end or error.
+ */
 inline static int bpf_map_lookup_and_delete_batch_compat(int fd, void* in_batch, void* out_batch,
                                                          void* keys, void* values,
                                                          unsigned int* count,
@@ -107,6 +114,10 @@ inline static int bpf_map_lookup_and_delete_batch_compat(int fd, void* in_batch,
   return 0;
 }
 
+/**
+ * @brief Compatibility implementation of lookup batch map API.
+ * @return 1 when batch filled and more entries may remain, -1 on ENOENT/end or error.
+ */
 inline static int bpf_map_lookup_batch_compat(int fd, void* in_batch, void* out_batch, void* keys,
                                               void* values, unsigned int* count,
                                               const struct bpf_map_batch_opts* opts) {

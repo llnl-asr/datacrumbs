@@ -1,10 +1,13 @@
 
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #include <datacrumbs/server/process/event_processor.h>
 // other headers
-#include <datacrumbs/common/configuration_manager.h>
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/data_structures.h>
 #include <datacrumbs/common/logging.h>
+#include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/common/utils.h>
@@ -15,10 +18,8 @@
 #include <datacrumbs/server/process/processing/usdt_event.h>
 // Include generated
 #include <datacrumbs/datacrumbs_config.h>
-#include <datacrumbs/server/process/generated_process.h>
 // dependency headers
 #include <json-c/json.h>
-#include <mpi.h>
 
 // std headers
 #include <fcntl.h>
@@ -46,15 +47,49 @@
 
 namespace datacrumbs {
 
-EventProcessor::EventProcessor(int argc, char** argv) {
-  configManager_ = datacrumbs::Singleton<datacrumbs::ConfigurationManager>::get_instance(
-      argc, argv, false, ExecutableType::DAEMON);
-  if (configManager_->exe_mode != datacrumbs::ExecutableMode::STOP) {
-    // Initialize the ChromeWriter singleton instance
-    writer_ = datacrumbs::Singleton<datacrumbs::ChromeWriter>::get_instance();
-    if (!writer_) {
-      DC_LOG_ERROR("Failed to create ChromeWriter instance");
-    }
+namespace {
+
+bool is_char_pointer_type(const std::string& c_type) {
+  return c_type.find("char *") != std::string::npos ||
+         c_type.find("const char *") != std::string::npos;
+}
+
+std::unique_ptr<DataCrumbsArgs> build_runtime_args(
+    const generic_event_t* event, const datacrumbs::RuntimeEventMetadata* metadata) {
+  if (event == nullptr || metadata == nullptr || metadata->arg_specs.empty()) {
+    return nullptr;
+  }
+
+  // Build named argument map using capture metadata so writer can serialize rich values.
+  auto args = std::make_unique<DataCrumbsArgs>();
+  const unsigned int arg_count =
+      std::min<unsigned int>(event->arg_count, metadata->arg_specs.size());
+  for (unsigned int index = 0; index < arg_count; ++index) {
+    const auto& spec = metadata->arg_specs[index];
+    CapturedArgumentValue value;
+    value.c_type = spec.c_type;
+    value.is_pointer = spec.is_pointer;
+    value.raw_value = event->args[index];
+    value.data_status = event->arg_data_status[index];
+    const unsigned int data_len = std::min<unsigned int>(
+        event->arg_data_len[index],
+        is_char_pointer_type(spec.c_type) ? DATACRUMBS_MAX_CAPTURE_BYTES : 8U);
+    value.bytes.assign(event->arg_data[index], event->arg_data[index] + data_len);
+
+    std::string label = spec.label.empty() ? ("arg" + std::to_string(index + 1)) : spec.label;
+    args->emplace(std::move(label), std::move(value));
+  }
+  return args;
+}
+
+}  // namespace
+
+EventProcessor::EventProcessor(const std::filesystem::path& probe_file) {
+  (void)probe_file;
+  configManager_ = datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
+  writer_ = datacrumbs::Singleton<datacrumbs::ChromeWriter>::get_instance();
+  if (!writer_) {
+    DC_LOG_ERROR("Failed to create ChromeWriter instance");
   }
   failed_events = 0;
 }
@@ -63,12 +98,13 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
   DC_LOG_TRACE("handle_event: start");
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-  struct general_event_t* event = (general_event_t*)data;
+  struct generic_event_t* event = (generic_event_t*)data;
 #else
   struct profile_key_t* event = (profile_key_t*)((counter_event_t*)data)->key;
 #endif
   unsigned int pid = event->id;
 
+  // Skip empty identity payloads to avoid emitting malformed trace entries.
   if (pid == 0) {
     DC_LOG_DEBUG("handle_event: pid is 0, skipping event");
     return 0;
@@ -79,12 +115,20 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
     // Print event info to stdout for debugging
     DC_LOG_DEBUG("%-6u  %-6llu  %s.%s", pid, event->event_id, probe_name.c_str(),
                  function_name.c_str());
-    // Write event to Chrome trace file
+    // Resolve writer instance and route event to the appropriate payload converter.
     auto writer = datacrumbs::Singleton<datacrumbs::ChromeWriter>::get_instance();
     if (!writer) {
       DC_LOG_ERROR("Failed to create ChromeWriter instance");
       return 1;
     }
+#if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
+    auto metadata = configManager_->get_runtime_event_metadata(event->event_id);
+    auto runtime_args = build_runtime_args(event, metadata);
+    auto write_event =
+        new datacrumbs::EventWithId(NORMAL_EVENT, event_index.fetch_add(1), event->type, event->id,
+                                    event->event_id, event->ts, event->dur, runtime_args.release());
+    writer->push_event(write_event);
+#else
     if (event->type > 0) {
       if (event->type == 1) {
         GET_DATA_FUNCTION(1);
@@ -142,18 +186,16 @@ int EventProcessor::handle_event(void* data, size_t data_sz) {
       DC_LOG_WARN("Event type is not positive, skipping event");
       return 0;
     }
-
+#endif
   } else {
     // If no category found, print warning
     DC_LOG_WARN("No category found for event_id %llu", event->event_id);
   }
   DC_LOG_TRACE("handle_event: end");
-  // std::string progress_msg =
-  //     "Processed events failed: " + std::to_string(failed_events) + " current:";
-  // if (configManager_->mpi_rank == 0) DC_LOG_PROGRESS_SINGLE(progress_msg.c_str(), event_index);
   return 0;
 }
 int EventProcessor::update_filename(const char* filename, unsigned int hash) {
+  // De-duplicate filename metadata records by hash to reduce trace noise and size.
   if (processed_hashes_.find(hash) != processed_hashes_.end()) {
     DC_LOG_DEBUG("Filename %s with hash %u already processed, skipping", filename, hash);
     return 0;  // Skip if already processed
@@ -172,6 +214,7 @@ int EventProcessor::update_filename(const char* filename, unsigned int hash) {
   return 0;
 }
 int EventProcessor::finalize() {
+  // Flush writer queue and close output stream after final event counters are logged.
   DC_LOG_PRINT("Collected %d events and failed %d events", event_index.load(), failed_events);
   auto writer_ = datacrumbs::Singleton<datacrumbs::ChromeWriter>::get_instance();
   if (writer_) {

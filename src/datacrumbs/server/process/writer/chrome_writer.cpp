@@ -1,12 +1,174 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #include <datacrumbs/server/process/writer/chrome_writer.h>
 // internal headers
-#include <datacrumbs/common/configuration_manager.h>
 #include <datacrumbs/common/constants.h>
 #include <datacrumbs/common/logging.h>
+#include <datacrumbs/common/runtime_configuration_manager.h>
 #include <datacrumbs/common/singleton.h>
 #include <datacrumbs/common/typedefs.h>
 #include <datacrumbs/server/bpf/shared.h>
 #include <datacrumbs/server/process/compress/zlib_compressor.h>
+#include <json-c/json.h>
+
+#include <cstring>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+
+namespace {
+
+/**
+ * @brief Render a string as a quoted, escaped JSON string literal.
+ *
+ * Escaping is delegated to json-c rather than hand-rolled. NOSLASHESCAPE keeps
+ * forward slashes literal, which matters because most values here are file
+ * paths, and _len is used so a value containing an embedded NUL is not
+ * truncated at it.
+ *
+ * @param input Raw bytes to render. Example: "/usr/lib64/libc.so.6".
+ * @return Quoted JSON string including the surrounding double quotes.
+ */
+std::string json_quoted(const std::string& input) {
+  json_object* value = json_object_new_string_len(input.data(), static_cast<int>(input.size()));
+  if (value == nullptr) {
+    return "\"\"";
+  }
+  const char* rendered = json_object_to_json_string_ext(
+      value, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+  std::string result = rendered != nullptr ? rendered : "\"\"";
+  json_object_put(value);
+  return result;
+}
+
+std::string bytes_to_hex(const std::vector<unsigned char>& bytes) {
+  std::ostringstream oss;
+  oss << std::hex << std::setfill('0');
+  for (unsigned char byte : bytes) {
+    oss << std::setw(2) << static_cast<unsigned int>(byte);
+  }
+  return oss.str();
+}
+
+std::string pointer_json(unsigned long long raw_value) {
+  std::ostringstream oss;
+  oss << "\"0x" << std::hex << raw_value << "\"";
+  return oss.str();
+}
+
+bool is_char_pointer_type(const std::string& c_type) {
+  return c_type.find("char *") != std::string::npos ||
+         c_type.find("const char *") != std::string::npos;
+}
+bool is_float_type(const std::string& c_type) {
+  return c_type == "float";
+}
+bool is_double_type(const std::string& c_type) {
+  return c_type == "double";
+}
+bool is_signed_type(const std::string& c_type) {
+  if (c_type.empty()) return false;
+  if (c_type.find("unsigned") != std::string::npos) return false;
+  return c_type.find("int") != std::string::npos || c_type.find("long") != std::string::npos ||
+         c_type.find("short") != std::string::npos || c_type.find("ssize_t") != std::string::npos ||
+         c_type.find("pid_t") != std::string::npos || c_type == "char";
+}
+
+std::string decode_scalar_json(const CapturedArgumentValue& value) {
+  const unsigned int width = std::min<std::size_t>(value.bytes.size(), sizeof(unsigned long long));
+  unsigned long long raw = 0;
+  if (width > 0) {
+    std::memcpy(&raw, value.bytes.data(), width);
+  } else {
+    raw = value.raw_value;
+  }
+
+  if (is_float_type(value.c_type) && width >= sizeof(float)) {
+    float number = 0.0f;
+    std::memcpy(&number, value.bytes.data(), sizeof(float));
+    return std::to_string(number);
+  }
+  if (is_double_type(value.c_type) && width >= sizeof(double)) {
+    double number = 0.0;
+    std::memcpy(&number, value.bytes.data(), sizeof(double));
+    return std::to_string(number);
+  }
+  if (is_signed_type(value.c_type)) {
+    long long signed_value = 0;
+    switch (width) {
+      case 1:
+        signed_value = static_cast<signed char>(raw & 0xff);
+        break;
+      case 2:
+        signed_value = static_cast<short>(raw & 0xffff);
+        break;
+      case 4:
+        signed_value = static_cast<int>(raw & 0xffffffffu);
+        break;
+      default:
+        signed_value = static_cast<long long>(raw);
+        break;
+    }
+    return std::to_string(signed_value);
+  }
+  return std::to_string(raw);
+}
+
+std::string serialize_captured_argument(const CapturedArgumentValue& value) {
+  if (value.is_pointer) {
+    if (value.data_status == 2 && !value.bytes.empty()) {
+      if (is_char_pointer_type(value.c_type)) {
+        std::string text;
+        for (unsigned char ch : value.bytes) {
+          if (ch == '\0') break;
+          text.push_back(static_cast<char>(ch));
+        }
+        return json_quoted(text);
+      }
+      std::ostringstream oss;
+      oss << "{\"value\":" << decode_scalar_json(value)
+          << ",\"address\":" << pointer_json(value.raw_value) << "}";
+      return oss.str();
+    }
+    return pointer_json(value.raw_value);
+  }
+
+  if ((value.data_status == 1 || value.data_status == 2) && !value.bytes.empty()) {
+    return decode_scalar_json(value);
+  }
+
+  if (!value.bytes.empty()) {
+    return "\"0x" + bytes_to_hex(value.bytes) + "\"";
+  }
+
+  return std::to_string(value.raw_value);
+}
+
+std::string serialize_any_value(const std::any& value) {
+  if (value.type() == typeid(int)) {
+    return std::to_string(std::any_cast<int>(value));
+  } else if (value.type() == typeid(unsigned long long)) {
+    return std::to_string(std::any_cast<unsigned long long>(value));
+  } else if (value.type() == typeid(unsigned int)) {
+    return std::to_string(std::any_cast<unsigned int>(value));
+  } else if (value.type() == typeid(uint64_t)) {
+    return std::to_string(std::any_cast<uint64_t>(value));
+  } else if (value.type() == typeid(float)) {
+    return std::to_string(std::any_cast<float>(value));
+  } else if (value.type() == typeid(double)) {
+    return std::to_string(std::any_cast<double>(value));
+  } else if (value.type() == typeid(const char*)) {
+    return json_quoted(std::any_cast<const char*>(value));
+  } else if (value.type() == typeid(std::string)) {
+    return json_quoted(std::any_cast<std::string>(value));
+  } else if (value.type() == typeid(CapturedArgumentValue)) {
+    return serialize_captured_argument(std::any_cast<CapturedArgumentValue>(value));
+  }
+  return "\"<unsupported>\"";
+}
+
+}  // namespace
 
 // Specialization of the Singleton instance for KSymCapture.
 // This holds the shared pointer to the singleton instance.
@@ -19,8 +181,10 @@ template <>
 bool datacrumbs::Singleton<datacrumbs::ChromeWriter>::stop_creating_instances = false;
 
 namespace datacrumbs {
-ChromeWriter::ChromeWriter() : stop_flag_(false), chunk_size_(16 * 1024 * 1024) {
-  auto configManager_ = datacrumbs::Singleton<datacrumbs::ConfigurationManager>::get_instance();
+ChromeWriter::ChromeWriter() : stop_flag_(false), finalized_(false), chunk_size_(16 * 1024 * 1024) {
+  // Initialize compression sink with runtime-configured output path.
+  auto configManager_ =
+      datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
   compressor_ = new ZlibCompression(configManager_->trace_file_path, chunk_size_);
   // file_ = std::fopen(configManager_->trace_file_path.c_str(), "a+");
   auto pwd = getpwnam(configManager_->user.c_str());
@@ -32,21 +196,34 @@ ChromeWriter::ChromeWriter() : stop_flag_(false), chunk_size_(16 * 1024 * 1024) 
   chmod(configManager_->trace_file_path.c_str(), 0660);
   compressor_->compress("[\n");
   first_event_ = true;
+  // Start asynchronous queue consumer.
   worker_ = std::thread([this]() { this->worker_loop(); });
 }
 
 // Destructor flushes and closes the file, and joins the worker thread.
-ChromeWriter::~ChromeWriter() {}
+ChromeWriter::~ChromeWriter() {
+  finalize();
+  delete compressor_;
+  compressor_ = nullptr;
+}
 void ChromeWriter::finalize() {
-  DC_LOG_DEBUG("ChromeWriter worker loop exiting");
   {
+    // Gate finalization so repeated finalize()/destructor paths remain idempotent.
     std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (finalized_) {
+      return;
+    }
     stop_flag_ = true;
+    finalized_ = true;
   }
+  DC_LOG_DEBUG("ChromeWriter worker loop exiting");
   queue_cv_.notify_one();
   if (worker_.joinable()) worker_.join();
-  compressor_->compress("]");
-  compressor_->finalize();
+  if (compressor_ != nullptr) {
+    // Close JSON array and finalize gzip stream.
+    compressor_->compress("]");
+    compressor_->finalize();
+  }
   DC_LOG_DEBUG("ChromeWriter finalized");
 }
 
@@ -61,42 +238,28 @@ void ChromeWriter::push_event(EventWithId* event) {
 // Serialize and write a single event to the file, including event_id as "id".
 void ChromeWriter::write_event(EventWithId* event_with_id) {
   index_++;
-  auto configManager_ = datacrumbs::Singleton<datacrumbs::ConfigurationManager>::get_instance();
+  auto configManager_ =
+      datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance();
   uint64_t index = event_with_id->index;
   auto args = event_with_id->args;
 
   unsigned int pid = event_with_id->tgid_pid;
   unsigned int tid = event_with_id->tgid_pid >> 32;
+  // Resolve category/function labels from runtime event id mapping.
   auto it = configManager_->category_map.find(event_with_id->event_id);
   if (it != configManager_->category_map.end()) {
-    std::string probe_name;
-    std::string function_name;
-    if (event_with_id->type == 3) {
-      probe_name = "usdt";
-      unsigned int method = 0, clazz = 0;
-
-      if (args != nullptr) {
-        if (event_with_id->event_type == COUNTER_EVENT) {
-          // Handle COUNTER_EVENT specific logic
-          unsigned long long duration = std::any_cast<unsigned int>((*args)["duration"]);
-          if (duration > std::numeric_limits<unsigned long long>::max() / 1000) {
-            duration = std::numeric_limits<unsigned long long>::max();
-          } else {
-            duration = static_cast<unsigned long long>(std::floor(duration / 1000.0));
-          }
-          (*args)["duration"] = duration;
-        }
-        method = std::any_cast<unsigned int>((*args)["method"]);
-        clazz = std::any_cast<unsigned int>((*args)["clazz"]);
-        function_name = std::to_string(clazz) + "." + std::to_string(method);
-        args->erase("clazz");
-        args->erase("method");
+    std::string probe_name = it->second.first;
+    std::string function_name = it->second.second;
+    // Convert nanosecond-scale counter durations to microseconds for Chrome trace readability.
+    if (args != nullptr && event_with_id->event_type == COUNTER_EVENT &&
+        args->find("duration") != args->end()) {
+      unsigned long long duration = std::any_cast<unsigned int>((*args)["duration"]);
+      if (duration > std::numeric_limits<unsigned long long>::max() / 1000) {
+        duration = std::numeric_limits<unsigned long long>::max();
       } else {
-        function_name = "unknown";
+        duration = static_cast<unsigned long long>(std::floor(duration / 1000.0));
       }
-    } else {
-      probe_name = it->second.first;
-      function_name = it->second.second;
+      (*args)["duration"] = duration;
     }
     char buffer[1024];
     unsigned long long ts_us = 0;
@@ -112,6 +275,7 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
       dur_us = static_cast<unsigned long long>(std::ceil(event_with_id->dur / 1000.0));
     }
     int len = 0;
+    // Build base event JSON for the specific phase marker type.
     if (event_with_id->event_type == COUNTER_EVENT) {
       len = std::snprintf(
           buffer, sizeof(buffer), R"({"id":%lu,"name":"%s","cat":"%s","ph":"%c","ts":%llu)", index_,
@@ -135,6 +299,7 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
 
     bool first = true;
     if (args != nullptr && !args->empty()) {
+      // Serialize dynamic key/value args map into JSON object payload.
       for (auto pair : *args) {
         const std::string& key = pair.first;
         const std::any& value = pair.second;
@@ -142,29 +307,7 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
         args_json += "\"";
         args_json += key;
         args_json += "\":";
-        if (value.type() == typeid(int)) {
-          args_json += std::to_string(std::any_cast<int>(value));
-        } else if (value.type() == typeid(unsigned long long)) {
-          args_json += std::to_string(std::any_cast<unsigned long long>(value));
-        } else if (value.type() == typeid(unsigned int)) {
-          args_json += std::to_string(std::any_cast<unsigned int>(value));
-        } else if (value.type() == typeid(uint64_t)) {
-          args_json += std::to_string(std::any_cast<uint64_t>(value));
-        } else if (value.type() == typeid(float)) {
-          args_json += std::to_string(std::any_cast<float>(value));
-        } else if (value.type() == typeid(double)) {
-          args_json += std::to_string(std::any_cast<double>(value));
-        } else if (value.type() == typeid(const char*)) {
-          args_json += "\"";
-          args_json += std::any_cast<const char*>(value);
-          args_json += "\"";
-        } else if (value.type() == typeid(std::string)) {
-          args_json += "\"";
-          args_json += std::any_cast<std::string>(value);
-          args_json += "\"";
-        } else {
-          args_json += "\"<unsupported>\"";
-        }
+        args_json += serialize_any_value(value);
         first = false;
       }
     }
@@ -172,12 +315,7 @@ void ChromeWriter::write_event(EventWithId* event_with_id) {
 
     {
       std::lock_guard<std::mutex> lock(file_mutex_);
-      std::string event_json;
-      if (first) {
-        event_json = std::string(buffer, len) + "}\n";
-      } else {
-        event_json = std::string(buffer, len) + ",\"args\":" + args_json + "}\n";
-      }
+      std::string event_json = std::string(buffer, len) + ",\"args\":" + args_json + "}\n";
       DC_LOG_DEBUG("Writing event: %s", event_json.c_str());
       compressor_->compress(event_json);
     }
@@ -197,6 +335,7 @@ void ChromeWriter::worker_loop() {
     EventWithId* event_with_id = nullptr;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
+      // Wait for either new work or explicit shutdown request.
       queue_cv_.wait(lock, [this] { return !event_queue_.empty() || stop_flag_; });
       if (event_queue_.empty() && stop_flag_) {
         break;

@@ -1,125 +1,324 @@
 #!/bin/bash
 
-set -e pipefail
+set -eo pipefail
 
-source @DATACRUMBS_INSTALL_BINARYDIR@/datacrumbs_setup
+readonly DATACRUMBS_SERVICE_SCHEDULER_TYPE="@DATACRUMBS_SCHEDULER_TYPE@"
+readonly DATACRUMBS_SERVICE_INSTALL_USER="@DATACRUMBS_INSTALL_USER@"
+readonly DATACRUMBS_SERVICE_JOB_ID_VAR="@DATACRUMBS_SCHEDULER_JOBID_ENV_VAR@"
+readonly DATACRUMBS_SERVICE_RUN_DIR="@DATACRUMBS_SERVER_RUN_DIR@"
+readonly DATACRUMBS_SERVICE_LOG_DIR="@DATACRUMBS_CONFIGURED_LOG_DIR@"
+readonly DATACRUMBS_SERVICE_RUN_ID_FILE="@DATACRUMBS_INSTALL_RUNSTATEDIR@/@PROJECT_NAME@/datacrumbs.runid"
 
-function get_general_datacrumbs_enabled() {
-  local enabled=${DATACRUMBS_ENABLED:-0}
-  enabled_value="no"
-  if [[ "${enabled}" -eq "1" ]]; then
-    enabled_value="yes"
+log_system() {
+  local message="$*"
+  if [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "FLUX" && -n "${FLUX_JOB_ID:-}" ]]; then
+    logger "[INFO $(date '+%Y-%m-%d %H:%M:%S') ${FLUX_JOB_ID}] ${message}"
+  elif [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "SLURM" && -n "${SLURM_JOB_ID:-}" ]]; then
+    logger "[INFO $(date '+%Y-%m-%d %H:%M:%S') ${SLURM_JOB_ID}] ${message}"
+  else
+    logger "[INFO $(date '+%Y-%m-%d %H:%M:%S')] ${message}"
   fi
-  log_system "get_general_datacrumbs_enabled returned enabled:${enabled_value}"
-  echo "${enabled_value}"
 }
 
-function get_flux_datacrumbs_enabled() {
-  local enabled=$(flux job info $FLUX_JOB_ID jobspec 2>/dev/null | jq -r .attributes.system.datacrumbs 2>/dev/null)
-  enabled_value="no"
-  if [[ ${enabled} == "null" ]]; then
-    log_system "User hasn't requested datacrumbs feature  enabled:${enabled}, exiting."
+log_user() {
+  local message="$*"
+  if [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "FLUX" && -n "${FLUX_JOB_ID:-}" ]]; then
+    flux job raise --severity=7 "${FLUX_JOB_ID}" -- \
+      "[INFO $(date '+%Y-%m-%d %H:%M:%S') ${FLUX_JOB_ID}] ${message}" >/dev/null
+  elif [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "SLURM" && -n "${SLURM_JOB_ID:-}" ]]; then
+    logger "[INFO $(date '+%Y-%m-%d %H:%M:%S') ${SLURM_JOB_ID}] ${message}"
   else
-    FLUX_DATACRUMBS=$(flux job info $FLUX_JOB_ID jobspec 2>/dev/null | jq -r .attributes.system.datacrumbs.enable 2>/dev/null)
-    if [[ ${FLUX_DATACRUMBS} == "null" || "${FLUX_DATACRUMBS}" != "yes" ]]; then
-      log_system "User hasn't requested datacrumbs feature  FLUX_DATACRUMBS:${FLUX_DATACRUMBS}, exiting."
-    else
-      enabled_value="yes"
+    logger "[INFO $(date '+%Y-%m-%d %H:%M:%S')] ${message}"
+  fi
+}
+
+error_user() {
+  local message="$*"
+  if [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "FLUX" && -n "${FLUX_JOB_ID:-}" ]]; then
+    flux job raise --severity=1 "${FLUX_JOB_ID}" -- \
+      "[ERROR $(date '+%Y-%m-%d %H:%M:%S') ${FLUX_JOB_ID}] ${message}" >/dev/null
+  elif [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "SLURM" && -n "${SLURM_JOB_ID:-}" ]]; then
+    logger "[ERROR $(date '+%Y-%m-%d %H:%M:%S') ${SLURM_JOB_ID}] ${message}"
+  else
+    logger "[ERROR $(date '+%Y-%m-%d %H:%M:%S')] ${message}"
+  fi
+}
+
+get_service_phase() {
+  if [[ -n "${DATACRUMBS_SERVICE_PHASE_OVERRIDE:-}" ]]; then
+    echo "${DATACRUMBS_SERVICE_PHASE_OVERRIDE}"
+    return 0
+  fi
+  case "$(basename "$0")" in
+  datacrumbs_service_run.sh) echo "prolog" ;;
+  datacrumbs_service_stop.sh) echo "epilog" ;;
+  *) echo "unknown" ;;
+  esac
+}
+
+resolve_user_from_uid() {
+  local user=""
+  local uid="$1"
+  if [[ -n "${uid}" ]]; then
+    user=$(id -nu "${uid}" 2>/dev/null || true)
+  fi
+  echo "${user}"
+}
+
+get_flux_actual_user() {
+  local phase="$1"
+  local user=""
+  if [[ "${phase}" == "prolog" ]]; then
+    if [[ -n "${FLUX_JOB_USERID:-}" ]]; then
+      user=$(resolve_user_from_uid "${FLUX_JOB_USERID}")
+    fi
+    if [[ -z "${user}" && -n "${FLUX_JOB_USER:-}" ]]; then
+      user="${FLUX_JOB_USER}"
+    fi
+  else
+    if [[ -n "${FLUX_JOB_USER:-}" ]]; then
+      user="${FLUX_JOB_USER}"
+    fi
+    if [[ -z "${user}" && -n "${FLUX_JOB_USERID:-}" ]]; then
+      user=$(resolve_user_from_uid "${FLUX_JOB_USERID}")
     fi
   fi
-  log_system "get_flux_datacrumbs_enabled returned enabled:${enabled_value}"
-  echo "${enabled_value}"
+  echo "${user}"
 }
 
-function get_slurm_comment() {
-  local slurm_job_comment=$(scontrol show job $SLURM_JOB_ID | grep -i comment | awk -F'=' '{print $2}')
-  echo $slurm_job_comment
-}
-
-function get_slurm_datacrumbs_enabled() {
-  enabled_value="no"
-  local slurm_job_comment=$(get_slurm_comment)
-  # NOTE: If SLURM_JOB_COMMENT which is a JSON
-  # of format {datacrumbs: {enable: "yes|no", composite: name}}.
-  # says datacrumbs enable is yes, else remains the same.
-  if [[ $(echo ${slurm_job_comment} | jq -r .datacrumbs.enable 2>/dev/null) == "yes" ]]; then
-    enabled_value="yes"
-  fi
-  log_system "get_slurm_datacrumbs_enabled returned enabled:${enabled_value}"
-  echo "${enabled_value}"
-}
-
-function get_datacrumbs_enabled() {
-  local enabled="no"
-  if [[ "FLUX" == "@DATACRUMBS_LAUNCHER_TYPE@" ]]; then
-    enabled=$(get_flux_datacrumbs_enabled)
-  elif [[ "@DATACRUMBS_LAUNCHER_TYPE@" == "SLURM" ]]; then
-    local slurm_job_comment=$(get_slurm_comment)
-    log_system "Slurm comment: $slurm_job_comment"
-    enabled=$(get_slurm_datacrumbs_enabled)
+get_slurm_actual_user() {
+  local phase="$1"
+  local user=""
+  if [[ "${phase}" == "prolog" ]]; then
+    if [[ -n "${SLURM_JOB_USER:-}" ]]; then
+      user="${SLURM_JOB_USER}"
+    fi
+    if [[ -z "${user}" && -n "${SLURM_JOB_UID:-}" ]]; then
+      user=$(resolve_user_from_uid "${SLURM_JOB_UID}")
+    fi
   else
-    enabled=$(get_general_datacrumbs_enabled)
-  fi
-  log_system "get_datacrumbs_enabled returned enabled:${enabled}"
-  echo "${enabled}"
-}
-
-function get_flux_datacrumbs_composite_name() {
-  local composite_name=$(flux job info $FLUX_JOB_ID jobspec | jq -r .attributes.system.datacrumbs.composite 2>/dev/null)
-  if [[ ${composite_name} == "null" || ${composite_name} == "" ]]; then
-    log_system "User hasn't requested datacrumbs' composite feature using ${composite_name}.""ERROR"
-  else
-    log_system "User has requested datacrumbs' composite feature using ${composite_name}."
-  fi
-  log_system "get_flux_datacrumbs_composite_name returned composite_name:${composite_name}"
-  echo "${composite_name}"
-}
-
-function get_slurm_datacrumbs_composite_name() {
-  local composite_name=$(get_default_datacrumbs_composite_name)
-  local slurm_job_comment=$(get_slurm_comment)
-  local slurm_composite="$(echo ${slurm_job_comment} | jq -r .datacrumbs.composite 2>/dev/null)"
-  if [[ 
-    ${slurm_composite} == "" ||
-    ${slurm_composite} == "NONE" ||
-    ${slurm_composite} == "null" ||
-    ${slurm_composite} == $(get_default_datacrumbs_composite_name) ]] \
-    ; then
-    log_system "User hasn't requested datacrumbs' composite feature using ${composite_name}"
-  else
-    log_system "User has requested datacrumbs' composite feature using ${composite_name}."
-  fi
-  log_system "get_slurm_datacrumbs_composite_name returned composite_name:${composite_name}"
-  echo "${composite_name}"
-}
-
-function get_general_datacrumbs_composite_name() {
-  local composite_name=$(get_default_datacrumbs_composite_name)
-  if [[ ${DATACRUMBS_COMPOSITE_NAME} == "null" || ${composite_name} == "" ]]; then
-    log_system "User hasn't requested datacrumbs' composite feature using ${composite_name}."
-  else
-    log_system "User has requested datacrumbs' composite feature using ${composite_name}."
-  fi
-  log_system "get_general_datacrumbs_composite_name returned composite_name:${composite_name}"
-  echo "${composite_name}"
-}
-
-function get_datacrumbs_composite_name() {
-  local name=$(get_default_datacrumbs_composite_name)
-  if [[ "FLUX" == "@DATACRUMBS_LAUNCHER_TYPE@" ]]; then
-    name=$(get_flux_datacrumbs_composite_name)
-  elif [[ "@DATACRUMBS_LAUNCHER_TYPE@" == "SLURM" ]]; then
-    name=$(get_slurm_datacrumbs_composite_name)
-  else
-    name=$(get_general_datacrumbs_composite_name)
-  fi
-  if [[ "${name}" != "$(get_default_datacrumbs_composite_name)" && "${name}" != "ERROR" ]]; then
-    if ! validate_datacrumbs_composite_name "${name}"; then
-      name="ERROR"
+    if [[ -n "${SLURM_JOB_UID:-}" ]]; then
+      user=$(resolve_user_from_uid "${SLURM_JOB_UID}")
+    fi
+    if [[ -z "${user}" && -n "${SLURM_JOB_USER:-}" ]]; then
+      user="${SLURM_JOB_USER}"
     fi
   fi
-  log_system "get_datacrumbs_composite_name returned name:${name}"
-  echo "${name}"
+  echo "${user}"
+}
+
+get_actual_user() {
+  local phase
+  phase=$(get_service_phase)
+  if [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "FLUX" ]]; then
+    get_flux_actual_user "${phase}"
+  elif [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "SLURM" ]]; then
+    get_slurm_actual_user "${phase}"
+  fi
+}
+
+if [[ -z "${DATACRUMBS_USER:-}" ]]; then
+  if [[ "$(id -u)" != "0" ]]; then
+    DATACRUMBS_USER=$(id -un)
+  elif [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    DATACRUMBS_USER="${SUDO_USER}"
+  else
+    DATACRUMBS_USER=$(get_actual_user)
+    if [[ -z "${DATACRUMBS_USER}" || "${DATACRUMBS_USER}" == "root" ]]; then
+      DATACRUMBS_USER="${USER:-${DATACRUMBS_SERVICE_INSTALL_USER}}"
+    fi
+  fi
+fi
+readonly DATACRUMBS_USER
+export DATACRUMBS_USER
+
+json_field_or_empty() {
+  local json_line="$1"
+  local jq_expr="$2"
+  if [[ -z "${json_line}" ]]; then
+    return 0
+  fi
+  echo "${json_line}" | jq -r "${jq_expr} // empty" 2>/dev/null || true
+}
+
+get_datacrumbs_json_override() {
+  if [[ -n "${DATACRUMBS_SERVICE_JSON_OVERRIDE:-}" ]]; then
+    echo "${DATACRUMBS_SERVICE_JSON_OVERRIDE}"
+  fi
+}
+
+unsupported_scheduler() {
+  error_user "Unsupported scheduler type for datacrumbs service scripts: ${DATACRUMBS_SERVICE_SCHEDULER_TYPE}"
+  return 1
+}
+
+get_slurm_comment_json() {
+  scontrol show job "${SLURM_JOB_ID}" | grep -i comment | awk -F'=' '{print $2}'
+}
+
+get_flux_datacrumbs_json() {
+  flux job info "${FLUX_JOB_ID}" jobspec 2>/dev/null |
+    jq -c '.attributes.system.datacrumbs // empty' 2>/dev/null || true
+}
+
+get_slurm_datacrumbs_json() {
+  local comment_json
+  comment_json=$(get_slurm_comment_json)
+  echo "${comment_json}" | jq -c '.datacrumbs // empty' 2>/dev/null || true
+}
+
+get_datacrumbs_json() {
+  local override_json
+  override_json=$(get_datacrumbs_json_override)
+  if [[ -n "${override_json}" ]]; then
+    echo "${override_json}"
+    return 0
+  fi
+  if [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "FLUX" ]]; then
+    get_flux_datacrumbs_json
+  elif [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "SLURM" ]]; then
+    get_slurm_datacrumbs_json
+  else
+    unsupported_scheduler
+  fi
+}
+
+get_flux_datacrumbs_enabled() {
+  local metadata_json
+  metadata_json=$(get_flux_datacrumbs_json)
+  if [[ "$(json_field_or_empty "${metadata_json}" '.enable')" == "yes" ]]; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+get_slurm_datacrumbs_enabled() {
+  local metadata_json
+  metadata_json=$(get_slurm_datacrumbs_json)
+  if [[ "$(json_field_or_empty "${metadata_json}" '.enable')" == "yes" ]]; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+get_datacrumbs_enabled() {
+  if [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "FLUX" ]]; then
+    get_flux_datacrumbs_enabled
+  elif [[ "${DATACRUMBS_SERVICE_SCHEDULER_TYPE}" == "SLURM" ]]; then
+    get_slurm_datacrumbs_enabled
+  else
+    unsupported_scheduler
+  fi
+}
+
+get_datacrumbs_probe_file() {
+  local metadata_json
+  local probe_file=""
+
+  metadata_json=$(get_datacrumbs_json)
+  probe_file=$(json_field_or_empty "${metadata_json}" '.probe_file')
+
+  echo "${probe_file}"
+}
+
+probe_file_readable_by_user() {
+  local probe_file="$1"
+  local submitting_user="$2"
+  if [[ ! -r "${probe_file}" ]]; then
+    return 1
+  fi
+  if [[ -z "${submitting_user}" || "${submitting_user}" == "$(id -un)" ]]; then
+    return 0
+  fi
+  if [[ "$(id -u)" == "0" ]]; then
+    su -s /bin/bash - "${submitting_user}" -c "test -r \"${probe_file}\"" >/dev/null 2>&1
+  else
+    sudo -n -u "${submitting_user}" test -r "${probe_file}" >/dev/null 2>&1
+  fi
+}
+
+get_run_id() {
+  local job_id_var="${DATACRUMBS_SERVICE_JOB_ID_VAR}"
+  local job_id_value=""
+  if [[ -n "${job_id_var}" && "${job_id_var}" != "NONE" ]]; then
+    job_id_value="${!job_id_var-}"
+  fi
+
+  if [[ -n "${job_id_value}" ]]; then
+    echo "${job_id_value}"
+  elif [[ -f "${DATACRUMBS_SERVICE_RUN_ID_FILE}" ]]; then
+    cat "${DATACRUMBS_SERVICE_RUN_ID_FILE}" 2>/dev/null
+  else
+    date +"%Y%m%d%H%M%S"
+  fi
+}
+
+escape_env_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+write_service_env_file() {
+  local env_file="$1"
+  local probe_file="$2"
+  local env_dir
+  local tmp_env_file
+  env_dir="$(dirname "${env_file}")"
+  tmp_env_file="$(mktemp)"
+  trap 'rm -f "${tmp_env_file}"' RETURN
+
+  printf 'DATACRUMBS_PROBE_FILE=%s\n' "$(escape_env_value "${probe_file}")" >"${tmp_env_file}"
+  printf 'DATACRUMBS_USER=%s\n' "$(escape_env_value "${DATACRUMBS_USER}")" >>"${tmp_env_file}"
+  printf 'DATACRUMBS_SERVICE_RUN_ID=%s\n' "$(escape_env_value "${DATACRUMBS_SERVICE_RUN_ID}")" >>"${tmp_env_file}"
+  printf 'DATACRUMBS_LOG_DIR=%s\n' "$(escape_env_value "${DATACRUMBS_SERVICE_LOG_DIR}")" >>"${tmp_env_file}"
+
+  if [[ "$(id -u)" == "0" ]]; then
+    mkdir -p "${env_dir}"
+    install -m 0400 "${tmp_env_file}" "${env_file}"
+  else
+    sudo mkdir -p "${env_dir}"
+    sudo install -m 0400 "${tmp_env_file}" "${env_file}"
+  fi
+}
+
+remove_service_env_file() {
+  local env_file="$1"
+  if [[ "$(id -u)" == "0" ]]; then
+    rm -f "${env_file}"
+  else
+    sudo rm -f "${env_file}"
+  fi
+}
+
+systemctl_cmd() {
+  if [[ "$(id -u)" == "0" ]]; then
+    systemctl "$@"
+  else
+    sudo systemctl "$@"
+  fi
+}
+
+wait_for_unit_inactive() {
+  local unit_name="$1"
+  local timeout_seconds="${2:-300}"
+  local elapsed=0
+  local state=""
+
+  while ((elapsed < timeout_seconds)); do
+    state="$(systemctl_cmd is-active "${unit_name}" 2>/dev/null || true)"
+    if [[ "${state}" == "inactive" || "${state}" == "failed" || "${state}" == "unknown" ]]; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  error_user "Timed out waiting for ${unit_name} to stop."
+  return 1
 }
 
 DATACRUMBS_ENABLED=$(get_datacrumbs_enabled)
@@ -127,16 +326,34 @@ if [[ "${DATACRUMBS_ENABLED}" != "yes" ]]; then
   log_system "User hasn't requested datacrumbs feature, exiting."
   return 1
 fi
-DATACRUMBS_COMPOSABLE_NAME=$(get_datacrumbs_composite_name)
-if [[ "${DATACRUMBS_COMPOSABLE_NAME}" == "ERROR" ]]; then
+
+DATACRUMBS_PROBE_FILE=$(get_datacrumbs_probe_file)
+DATACRUMBS_SERVICE_REQUIRE_PROBE_FILE="${DATACRUMBS_SERVICE_REQUIRE_PROBE_FILE:-1}"
+if [[ "${DATACRUMBS_SERVICE_REQUIRE_PROBE_FILE}" == "1" && -z "${DATACRUMBS_PROBE_FILE}" ]]; then
+  error_user "Datacrumbs is enabled but no probes file was provided for the systemd service."
   return 1
 fi
-if [[ "${DATACRUMBS_COMPOSABLE_NAME}" == "$(get_default_datacrumbs_composite_name)" ]]; then
-  log_user "Running system datacrumbs"
-else
-  log_user "Running a composite datacrumbs with name: ${DATACRUMBS_COMPOSABLE_NAME}"
+if [[ -n "${DATACRUMBS_PROBE_FILE}" && ! -f "${DATACRUMBS_PROBE_FILE}" ]]; then
+  error_user "Datacrumbs probe file not found: ${DATACRUMBS_PROBE_FILE}"
+  return 1
+fi
+if [[ -n "${DATACRUMBS_PROBE_FILE}" ]] && ! probe_file_readable_by_user "${DATACRUMBS_PROBE_FILE}" "${DATACRUMBS_USER}"; then
+  error_user "Datacrumbs probe file is not readable by submitting user ${DATACRUMBS_USER}: ${DATACRUMBS_PROBE_FILE}"
+  return 1
 fi
 
-readonly DATACRUMBS_COMPOSABLE_NAME
-export DATACRUMBS_COMPOSABLE_NAME
-export DATACRUMBS_USER
+DATACRUMBS_SERVICE_RUN_ID=$(get_run_id)
+DATACRUMBS_SERVICE_ENV_FILE="${DATACRUMBS_SERVICE_RUN_DIR}/datacrumbs-${DATACRUMBS_SERVICE_RUN_ID}.env"
+
+readonly DATACRUMBS_ENABLED
+readonly DATACRUMBS_PROBE_FILE
+readonly DATACRUMBS_SERVICE_RUN_ID
+readonly DATACRUMBS_SERVICE_ENV_FILE
+export DATACRUMBS_ENABLED
+export DATACRUMBS_PROBE_FILE
+export DATACRUMBS_SERVICE_RUN_ID
+export DATACRUMBS_SERVICE_ENV_FILE
+
+if [[ -n "${DATACRUMBS_PROBE_FILE}" ]]; then
+  log_user "Starting systemd datacrumbs service with probes file: ${DATACRUMBS_PROBE_FILE}"
+fi

@@ -1,10 +1,12 @@
 #!/bin/bash
 
-set -e pipefail
+set -eo pipefail
 
-source @DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs_service_common.sh
-if [[ $? -eq 0 ]]; then
-  sudo systemctl stop datacrumbs@${DATACRUMBS_SERVER_RUN_ID}.service
-  sudo rm ${DATACRUMBS_SERVER_ENV_FILE}
+export DATACRUMBS_SERVICE_REQUIRE_PROBE_FILE=0
+if source @DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs_service_common.sh; then
+  log_system "Stopping datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service"
+  systemctl_cmd stop "datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service"
+  wait_for_unit_inactive "datacrumbs@${DATACRUMBS_SERVICE_RUN_ID}.service"
+  rm -f "${DATACRUMBS_SERVICE_ENV_FILE}"
 fi
 exit 0

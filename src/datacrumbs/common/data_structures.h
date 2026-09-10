@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #ifndef DATACRUMBS_COMMON_DATA_STRUCTURES_H__
 #define DATACRUMBS_COMMON_DATA_STRUCTURES_H__
 // include first
@@ -7,14 +10,71 @@
 #include <datacrumbs/common/enumerations.h>
 #include <datacrumbs/common/logging.h>
 #include <datacrumbs/common/typedefs.h>
-#include <datacrumbs/server/bpf/shared.h>
 // dependency headers
 #include <json-c/json.h>
+
+#ifndef DATACRUMBS_MAX_CAPTURE_ARGS
+#define DATACRUMBS_MAX_CAPTURE_ARGS 5
+#endif
+#ifndef DATACRUMBS_MAX_CAPTURE_BYTES
+#define DATACRUMBS_MAX_CAPTURE_BYTES 64
+#endif
 // std headers
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace datacrumbs {
+
+/**
+ * @brief Argument capture specification for one probe function argument.
+ */
+struct ProbeArgCaptureSpec {
+  unsigned int index = 0;
+  unsigned int num_bytes = 0;
+  bool is_pointer = false;
+  std::string label;
+  std::string c_type;
+
+  json_object* toJson() const {
+    json_object* j = json_object_new_object();
+    json_object_object_add(j, "index", json_object_new_int(index));
+    json_object_object_add(j, "num_bytes", json_object_new_int(num_bytes));
+    json_object_object_add(j, "is_pointer", json_object_new_boolean(is_pointer));
+    json_object_object_add(j, "label", json_object_new_string(label.c_str()));
+    json_object_object_add(j, "c_type", json_object_new_string(c_type.c_str()));
+    return j;
+  }
+
+  static ProbeArgCaptureSpec fromJson(const json_object* j) {
+    ProbeArgCaptureSpec spec;
+    json_object* obj = nullptr;
+    if (json_object_object_get_ex(j, "index", &obj)) spec.index = json_object_get_int(obj);
+    if (json_object_object_get_ex(j, "num_bytes", &obj)) spec.num_bytes = json_object_get_int(obj);
+    if (json_object_object_get_ex(j, "is_pointer", &obj)) {
+      spec.is_pointer = json_object_get_boolean(obj);
+    }
+    if (json_object_object_get_ex(j, "label", &obj) && obj)
+      spec.label = json_object_get_string(obj);
+    if (json_object_object_get_ex(j, "c_type", &obj) && obj)
+      spec.c_type = json_object_get_string(obj);
+    return spec;
+  }
+};
+
+/**
+ * @brief Runtime metadata mapped by event id for fast decode/writer lookup.
+ */
+struct RuntimeEventMetadata {
+  ProbeType probe_type = ProbeType::KPROBE;
+  std::string probe_name;
+  std::string function_name;
+  std::vector<ProbeArgCaptureSpec> arg_specs;
+};
+
+/**
+ * @brief Unified event wrapper used by runtime writers.
+ */
 struct EventWithId {
   char event_type;
   unsigned long long index;
@@ -58,19 +118,28 @@ struct EventWithId {
         args(other.args) {}
 };
 
-// Base class representing a generic probe
+/**
+ * @brief Base probe definition shared by runtime probe variants.
+ */
 class Probe {
  public:
   // Default constructor
   Probe() {}
   // Copy constructor
-  Probe(const Probe& other) : type(other.type), name(other.name), functions(other.functions) {
+  Probe(const Probe& other)
+      : type(other.type),
+        name(other.name),
+        functions(other.functions),
+        function_arguments(other.function_arguments) {
     DC_LOG_TRACE("Probe copy constructor called");
   }
 
   // Move constructor
   Probe(Probe&& other) noexcept
-      : type(other.type), name(std::move(other.name)), functions(std::move(other.functions)) {
+      : type(other.type),
+        name(std::move(other.name)),
+        functions(std::move(other.functions)),
+        function_arguments(std::move(other.function_arguments)) {
     DC_LOG_TRACE("Probe move constructor called");
   }
   // Constructor initializing the probe type
@@ -79,6 +148,13 @@ class Probe {
   ProbeType type;                      // The type of probe (e.g., SYSCALLS, KPROBE, etc.)
   std::string name;                    // Name of the probe
   std::vector<std::string> functions;  // List of functions or arguments for the probe
+  std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
+      function_arguments;  // Optional per-function runtime arg capture specification
+  /// Optional per-function declaration of where a newly created PID can be read
+  /// from, keyed by function name with a source name such as "return". Declared
+  /// in the user configuration and validated by the probe manager, so which
+  /// calls create processes is configuration rather than compiled-in knowledge.
+  std::unordered_map<std::string, std::string> new_pid_functions;
 
   // Validates the probe's configuration
   virtual bool validate() const {
@@ -112,6 +188,27 @@ class Probe {
 
     json_object_object_add(j, "functions", funcs);
 
+    if (!function_arguments.empty()) {
+      json_object* jfunction_arguments = json_object_new_object();
+      for (const auto& [function_name, arg_specs] : function_arguments) {
+        json_object* jarg_specs = json_object_new_array();
+        for (const auto& arg_spec : arg_specs) {
+          json_object_array_add(jarg_specs, arg_spec.toJson());
+        }
+        json_object_object_add(jfunction_arguments, function_name.c_str(), jarg_specs);
+      }
+      json_object_object_add(j, "function_arguments", jfunction_arguments);
+    }
+
+    if (!new_pid_functions.empty()) {
+      json_object* jnew_pid = json_object_new_object();
+      for (const auto& [function_name, source] : new_pid_functions) {
+        json_object_object_add(jnew_pid, function_name.c_str(),
+                               json_object_new_string(source.c_str()));
+      }
+      json_object_object_add(j, "new_pid_functions", jnew_pid);
+    }
+
     return j;
   }
 
@@ -130,11 +227,64 @@ class Probe {
         if (func) p.functions.push_back(json_object_get_string(func));
       }
     }
+
+    json_object* function_arguments_obj = json_object_object_get(j, "function_arguments");
+    if (function_arguments_obj &&
+        json_object_get_type(function_arguments_obj) == json_type_object) {
+      json_object_object_foreach(function_arguments_obj, function_name, arg_specs_obj) {
+        if (!arg_specs_obj || json_object_get_type(arg_specs_obj) != json_type_array) {
+          continue;
+        }
+        std::vector<ProbeArgCaptureSpec> arg_specs;
+        const int spec_len = json_object_array_length(arg_specs_obj);
+        for (int i = 0; i < spec_len; ++i) {
+          json_object* arg_spec_obj = json_object_array_get_idx(arg_specs_obj, i);
+          if (!arg_spec_obj || json_object_get_type(arg_spec_obj) != json_type_object) {
+            continue;
+          }
+          arg_specs.push_back(ProbeArgCaptureSpec::fromJson(arg_spec_obj));
+        }
+        p.function_arguments[function_name] = std::move(arg_specs);
+      }
+    }
+
+    json_object* new_pid_obj = json_object_object_get(j, "new_pid_functions");
+    if (new_pid_obj && json_object_get_type(new_pid_obj) == json_type_object) {
+      json_object_object_foreach(new_pid_obj, function_name, source_obj) {
+        if (!source_obj || json_object_get_type(source_obj) != json_type_string) {
+          continue;
+        }
+        p.new_pid_functions[function_name] = json_object_get_string(source_obj);
+      }
+    }
     return p;
+  }
+
+  const std::vector<ProbeArgCaptureSpec>* getArgSpecs(const std::string& function_name) const {
+    const auto it = function_arguments.find(function_name);
+    if (it == function_arguments.end()) {
+      return nullptr;
+    }
+    return &it->second;
+  }
+
+  /**
+   * @brief Name of the source a new PID can be read from for a function.
+   *
+   * @param function_name Function being attached. Example: "__x64_sys_clone3".
+   * @return Source name such as "return", or an empty string when this function
+   *         is not declared as creating a process.
+   */
+  const std::string& getNewPidSource(const std::string& function_name) const {
+    static const std::string kNone;
+    const auto it = new_pid_functions.find(function_name);
+    return it == new_pid_functions.end() ? kNone : it->second;
   }
 };
 
-// Probe for system calls
+/**
+ * @brief Probe definition for syscall function lists.
+ */
 struct SysCallProbe : public Probe {
  public:
   SysCallProbe(const SysCallProbe& other) : Probe(other) {
@@ -162,11 +312,14 @@ struct SysCallProbe : public Probe {
     p.type = base.type;
     p.name = base.name;
     p.functions = base.functions;
+    p.function_arguments = base.function_arguments;
     return p;
   }
 };
 
-// Probe for kernel functions (kprobes)
+/**
+ * @brief Probe definition for kernel kprobes.
+ */
 struct KProbe : public Probe {
  public:
   KProbe(const KProbe& other) : Probe(other) { DC_LOG_TRACE("KProbe copy constructor called"); }
@@ -194,11 +347,14 @@ struct KProbe : public Probe {
     p.type = base.type;
     p.name = base.name;
     p.functions = base.functions;
+    p.function_arguments = base.function_arguments;
     return p;
   }
 };
 
-// Probe for user-space functions (uprobes)
+/**
+ * @brief Probe definition for user-space uprobes.
+ */
 struct UProbe : public Probe {
  public:
   UProbe(const UProbe& other)
@@ -238,6 +394,7 @@ struct UProbe : public Probe {
     p.type = base.type;
     p.name = base.name;
     p.functions = base.functions;
+    p.function_arguments = base.function_arguments;
     json_object* bin_obj = json_object_object_get(j, "binary_path");
     if (bin_obj) p.binary_path = json_object_get_string(bin_obj);
 
@@ -248,7 +405,9 @@ struct UProbe : public Probe {
   }
 };
 
-// Probe for USDT (User-level Statically Defined Tracing) probes
+/**
+ * @brief Probe definition for USDT probes.
+ */
 struct USDTProbe : public Probe {
  public:
   USDTProbe(const USDTProbe& other)
@@ -293,6 +452,7 @@ struct USDTProbe : public Probe {
     p.type = base.type;
     p.name = base.name;
     p.functions = base.functions;
+    p.function_arguments = base.function_arguments;
 
     json_object* bin_obj = json_object_object_get(j, "binary_path");
     if (bin_obj) p.binary_path = json_object_get_string(bin_obj);
@@ -304,7 +464,9 @@ struct USDTProbe : public Probe {
   }
 };
 
-// Probe for USDT (User-level Statically Defined Tracing) probes
+/**
+ * @brief Probe definition for custom BPF-based probes.
+ */
 struct CustomProbe : public Probe {
  public:
   CustomProbe(const CustomProbe& other)
@@ -367,6 +529,7 @@ struct CustomProbe : public Probe {
     p.type = base.type;
     p.name = base.name;
     p.functions = base.functions;
+    p.function_arguments = base.function_arguments;
 
     json_object* bpf_obj = json_object_object_get(j, "bpf_path");
     if (bpf_obj) p.bpf_path = json_object_get_string(bpf_obj);
@@ -383,7 +546,9 @@ struct CustomProbe : public Probe {
   }
 };
 
-// Base class for capture probes (used for capturing symbols, headers, binaries, etc.)
+/**
+ * @brief Base configuration for explorer capture sources.
+ */
 class CaptureProbe {
  public:
   // Constructor initializing the capture type
@@ -394,9 +559,50 @@ class CaptureProbe {
   std::string name;      // Name of the capture probe
   ProbeType probe_type;  // Type of probe associated with the capture
   bool enable_explorer;  // Flag to enable explorer for this capture probe
+  std::unordered_map<std::string, std::vector<ProbeArgCaptureSpec>>
+      function_arguments;  // Optional per-function arg capture specification from YAML
+
+  const std::vector<ProbeArgCaptureSpec>* getArgSpecs(const std::string& function_name) const {
+    auto lookup = [this](const std::string& key) -> const std::vector<ProbeArgCaptureSpec>* {
+      const auto it = function_arguments.find(key);
+      if (it == function_arguments.end()) {
+        return nullptr;
+      }
+      return &it->second;
+    };
+
+    if (const auto* exact = lookup(function_name)) {
+      return exact;
+    }
+
+    const auto offset_pos = function_name.find(':');
+    const std::string base_name =
+        (offset_pos == std::string::npos) ? function_name : function_name.substr(0, offset_pos);
+    if (base_name != function_name) {
+      if (const auto* base = lookup(base_name)) {
+        return base;
+      }
+    }
+
+    if (probe_type == ProbeType::SYSCALLS) {
+      if (const auto* prefixed = lookup("sys_" + base_name)) {
+        return prefixed;
+      }
+      if (const auto* x64_prefixed = lookup("__x64_sys_" + base_name)) {
+        return x64_prefixed;
+      }
+    }
+
+    if (const auto* wildcard = lookup("*")) {
+      return wildcard;
+    }
+    return lookup("default");
+  }
 };
 
-// Capture probe for kernel symbols
+/**
+ * @brief Capture probe for kernel symbol source.
+ */
 class KernelCaptureProbe : public CaptureProbe {
  public:
   KernelCaptureProbe() : CaptureProbe(CaptureType::KSYM) {
@@ -404,7 +610,9 @@ class KernelCaptureProbe : public CaptureProbe {
   }
 };
 
-// Capture probe for header files
+/**
+ * @brief Capture probe for header-based symbol extraction.
+ */
 class HeaderCaptureProbe : public CaptureProbe {
  public:
   HeaderCaptureProbe() : CaptureProbe(CaptureType::HEADER), file() {
@@ -413,7 +621,9 @@ class HeaderCaptureProbe : public CaptureProbe {
   std::string file;  // Name of the header to capture
 };
 
-// Capture probe for binaries
+/**
+ * @brief Capture probe for ELF binary symbol extraction.
+ */
 class BinaryCaptureProbe : public CaptureProbe {
  public:
   BinaryCaptureProbe() : CaptureProbe(CaptureType::BINARY), file(), include_offsets(false) {
@@ -423,7 +633,9 @@ class BinaryCaptureProbe : public CaptureProbe {
   bool include_offsets;
 };
 
-// Capture probe for USDT probes
+/**
+ * @brief Capture probe for USDT provider/function extraction.
+ */
 class USDTCaptureProbe : public CaptureProbe {
  public:
   USDTCaptureProbe() : CaptureProbe(CaptureType::USDT), binary_path(), provider() {

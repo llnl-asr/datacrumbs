@@ -1,4 +1,4 @@
-name: Docker Build and Test
+name: VM Build and Flow Test
 
 on:
   push:
@@ -7,43 +7,415 @@ on:
   workflow_dispatch:
 
 env:
-  DOCKER_IMAGE_NAME: datacrumbs-test
-  DOCKER_TAG: latest
+  BUILD_DIR: /tmp/dc-build
+  UTILS_BUILD_DIR: /tmp/dc-utils-build
+  INSTALL_PREFIX: /tmp/dc-install
+  INSTALLED_CONFIG_TEMPLATE_YAML: /tmp/dc-install/etc/datacrumbs/configs/docker.yaml
+  CONFIG_TEMPLATE_YAML: ${{ github.workspace }}/datacrumbs-utils/docs/configs/docker.yaml
+  CONFIG_YAML: /tmp/datacrumbs-ci-config.yaml
+  PROBE_FILE: /tmp/datacrumbs-ci-probes.json.gz
+  JOB_ID: "1"
+  LOG_DIR: /tmp/datacrumbs-logs
+  TRACE_DIR: /tmp/datacrumbs-traces
+  OUT_FILE: /tmp/datacrumbs-ci-output.bin
+  BPFTOOL_SOURCE_REF: v7.5.0
+  BPFTOOLS_PREFIX: /tmp/dc-bpftools
 
 jobs:
-  docker-build-and-test:
-    runs-on: ubuntu-latest
+  vm-build-and-test:
+    name: VM ${{ matrix.flow_name }} (${{ matrix.os_name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os_name: ubuntu-22.04
+            runner: ubuntu-22.04
+            flow_name: Build and Flow Test
+            flow_id: manager
+          - os_name: ubuntu-24.04
+            runner: ubuntu-24.04
+            flow_name: Build and Flow Test
+            flow_id: manager
+    runs-on: ${{ matrix.runner }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout datacrumbs
         uses: actions/checkout@v4
         with:
+          path: datacrumbs
           submodules: recursive
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image
+      - name: Resolve compatible datacrumbs-utils ref
         run: |
-          docker buildx build \
-                  --cache-from=type=gha \
-                  --cache-to=type=gha,mode=max \
-                  --load \
-                  -t ${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_TAG }} \
-                  -f infrastructure/docker/Dockerfile \
-                  .
+          set -euo pipefail
+          cmake -DOUTPUT="${RUNNER_TEMP}/datacrumbs-utils-compatibility.env" \
+            -P "${GITHUB_WORKSPACE}/datacrumbs/cmake/write_datacrumbs_utils_compatibility_env.cmake"
+          cat "${RUNNER_TEMP}/datacrumbs-utils-compatibility.env" >> "${GITHUB_ENV}"
 
-      - name: Run DataCrumbs tests
+      - name: Checkout datacrumbs-utils
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DATACRUMBS_UTILS_COMPATIBLE_REPOSITORY }}
+          ref: ${{ env.DATACRUMBS_UTILS_COMPATIBLE_REF }}
+          fetch-depth: 1
+          path: datacrumbs-utils
+
+      - name: Install base build and runtime dependencies
         run: |
-          docker run --rm \
-                -v /lib/modules/:/lib/modules:ro \
-                -v /sys/kernel/debug/:/sys/kernel/debug:rw \
-                --net=host \
-                --pid=host \
-                --privileged \
-                --cap-add sys_admin \
-                --cap-add sys_ptrace \
-                --hostname docker \
-                -v /sys/fs/bpf:/sys/fs/bpf \
-                ${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_TAG }} \
-                bash -c /opt/datacrumbs/infrastructure/docker/test_run.sh
+          set -euo pipefail
+          sudo apt-get update
+
+          libclang_dev_pkg=$(apt-cache search '^libclang-[0-9]+-dev$' | awk '{print $1}' | sort -V | tail -n 1)
+          if [[ -z "${libclang_dev_pkg}" ]]; then
+            echo "Unable to determine a versioned libclang development package" >&2
+            exit 1
+          fi
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            git \
+            pkg-config \
+            clang \
+            llvm \
+            llvm-dev \
+            libclang-dev \
+            "${libclang_dev_pkg}" \
+            libelf-dev \
+            libssl-dev \
+            libcap-dev \
+            libyaml-cpp-dev \
+            libjson-c-dev \
+            zlib1g-dev \
+            jq \
+            patchelf \
+            python3 \
+            openmpi-bin \
+            libopenmpi-dev
+          if [[ ! -d "/usr/src/linux-headers-$(uname -r)" ]]; then
+            sudo apt-get install -y "linux-headers-$(uname -r)" || sudo apt-get install -y linux-headers-generic
+          fi
+
+      - name: Export LLVM toolchain paths
+        run: |
+          set -euo pipefail
+          llvm_include_dir="$(llvm-config --includedir)"
+          llvm_lib_dir="$(llvm-config --libdir)"
+          echo "C_INCLUDE_PATH=${llvm_include_dir}:${C_INCLUDE_PATH:-}" >> "${GITHUB_ENV}"
+          echo "CPLUS_INCLUDE_PATH=${llvm_include_dir}:${CPLUS_INCLUDE_PATH:-}" >> "${GITHUB_ENV}"
+          echo "LIBRARY_PATH=${llvm_lib_dir}:${LIBRARY_PATH:-}" >> "${GITHUB_ENV}"
+          echo "LD_LIBRARY_PATH=${llvm_lib_dir}:${LD_LIBRARY_PATH:-}" >> "${GITHUB_ENV}"
+
+      - name: Build and stage libbpf and bpftool from source
+        run: |
+          set -euo pipefail
+          workdir="${RUNNER_TEMP}/bpftool-src"
+          prefix="${BPFTOOLS_PREFIX}"
+          rm -rf "${workdir}" "${prefix}"
+          mkdir -p "${prefix}"
+          git clone https://github.com/libbpf/bpftool.git "${workdir}"
+          pushd "${workdir}"
+          git checkout tags/${BPFTOOL_SOURCE_REF} -b "${BPFTOOL_SOURCE_REF}"
+          git submodule update --init --recursive
+
+          pushd libbpf
+          git checkout tags/v1.5.0 -b v1.5.0
+          cd src
+          DESTDIR="${prefix}" make install -j"$(nproc)"
+          popd
+
+          cd src
+          DESTDIR="${prefix}" make install -j"$(nproc)"
+          popd
+
+          for staged_root in "${prefix}/usr/local" "${prefix}/usr"; do
+            if [[ ! -d "${staged_root}" ]]; then
+              continue
+            fi
+            for dir in include lib lib64 libexec bin sbin; do
+              if [[ -d "${staged_root}/${dir}" ]]; then
+                mkdir -p "${prefix}/${dir}"
+                find "${staged_root}/${dir}" -mindepth 1 -maxdepth 1 -exec mv {} "${prefix}/${dir}" \;
+              fi
+            done
+          done
+          rm -rf "${prefix}/usr"
+
+          bpftool_path=""
+          if [[ -x "${prefix}/sbin/bpftool" ]]; then
+            bpftool_path="${prefix}/sbin/bpftool"
+          elif [[ -x "${prefix}/bin/bpftool" ]]; then
+            bpftool_path="${prefix}/bin/bpftool"
+          else
+            echo "bpftool was not staged under ${prefix}" >&2
+            find "${prefix}" -maxdepth 4 -type f -name bpftool -print >&2 || true
+            exit 1
+          fi
+
+          libbpf_pc=$(find "${prefix}" -path '*/pkgconfig/libbpf.pc' -print -quit)
+          if [[ -z "${libbpf_pc}" ]]; then
+            echo "libbpf.pc was not staged under ${prefix}" >&2
+            find "${prefix}" -maxdepth 5 -type f -name 'libbpf*' -print >&2 || true
+            exit 1
+          fi
+
+          sed -i "s|^prefix=.*|prefix=${prefix}|" "${libbpf_pc}"
+          echo "Using staged bpftool: ${bpftool_path}"
+          echo "Using staged libbpf.pc: ${libbpf_pc}"
+          cat "${libbpf_pc}"
+
+      - name: Export source-built bpftool and libbpf environment
+        run: |
+          set -euo pipefail
+          echo "PATH=${BPFTOOLS_PREFIX}/bin:${BPFTOOLS_PREFIX}/sbin:${PATH}" >> "${GITHUB_ENV}"
+          echo "LD_LIBRARY_PATH=${BPFTOOLS_PREFIX}/lib:${BPFTOOLS_PREFIX}/lib64:${LD_LIBRARY_PATH:-}" >> "${GITHUB_ENV}"
+          echo "CMAKE_PREFIX_PATH=${BPFTOOLS_PREFIX}:${CMAKE_PREFIX_PATH:-}" >> "${GITHUB_ENV}"
+          echo "PKG_CONFIG_PATH=${BPFTOOLS_PREFIX}/lib/pkgconfig:${BPFTOOLS_PREFIX}/lib64/pkgconfig:${PKG_CONFIG_PATH:-}" >> "${GITHUB_ENV}"
+
+      - name: Verify runner supports systemd services
+        run: |
+          set -euo pipefail
+          systemctl --version
+          test -d /run/systemd/system
+
+      - name: Configure datacrumbs
+        run: |
+          set -euo pipefail
+          cmake -S "${GITHUB_WORKSPACE}/datacrumbs" -B "${BUILD_DIR}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+            -DBPFTOOL_EXECUTABLE="$(command -v bpftool)" \
+            -DDATACRUMBS_HOST=docker \
+            -DDATACRUMBS_SCHEDULER_TYPE=SLURM \
+            -DDATACRUMBS_USER="${USER}" \
+            -DDATACRUMBS_INSTALL_USER="${USER}" \
+            -DDATACRUMBS_CONFIGURED_LOG_DIR="${LOG_DIR}" \
+            -DDATACRUMBS_CONFIGURED_TRACE_DIR="${TRACE_DIR}" \
+            -DDATACRUMBS_KERNEL_HEADERS_PATH="/usr/src/linux-headers-$(uname -r)"
+
+      - name: Build datacrumbs
+        run: |
+          set -euo pipefail
+          cmake --build "${BUILD_DIR}" -j"$(nproc)"
+
+      - name: Install datacrumbs
+        run: |
+          set -euo pipefail
+          sudo cmake --install "${BUILD_DIR}"
+
+      - name: Configure compatible datacrumbs-utils
+        run: |
+          set -euo pipefail
+          cmake -S "${GITHUB_WORKSPACE}/datacrumbs-utils" -B "${UTILS_BUILD_DIR}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+            -DCMAKE_PREFIX_PATH="${INSTALL_PREFIX};${CMAKE_PREFIX_PATH:-}" \
+            -DDATACRUMBS_KERNEL_HEADERS_PATH="/usr/src/linux-headers-$(uname -r)"
+
+      - name: Build datacrumbs-utils
+        run: |
+          set -euo pipefail
+          cmake --build "${UTILS_BUILD_DIR}" -j"$(nproc)"
+
+      - name: Install datacrumbs-utils
+        run: |
+          set -euo pipefail
+          sudo cmake --install "${UTILS_BUILD_DIR}"
+
+      - name: Verify probe configurator linkage
+        run: |
+          set -euo pipefail
+          probe_exec="${INSTALL_PREFIX}/bin/datacrumbs_probe_configurator_exec"
+          probe_wrapper="${INSTALL_PREFIX}/bin/datacrumbs_probe_configurator"
+
+          test -x "${probe_exec}"
+          test -x "${probe_wrapper}"
+
+          echo "Wrapper LD_LIBRARY_PATH export:"
+          grep -n "LD_LIBRARY_PATH" "${probe_wrapper}"
+
+          echo "Probe configurator dynamic section:"
+          readelf -d "${probe_exec}" | grep -E 'NEEDED|RPATH|RUNPATH'
+
+          echo "Probe configurator shared library resolution:"
+          ldd "${probe_exec}"
+
+          ! ldd "${probe_exec}" | grep -q "not found"
+          ldd "${probe_exec}" | grep -q "libclang"
+
+      - name: Install and start runtime systemd units
+        run: |
+          set -euo pipefail
+          sudo ln -sf "${INSTALL_PREFIX}/etc/datacrumbs/systemd/datacrumbs_probe_manager.service" /etc/systemd/system/datacrumbs_probe_manager.service
+          sudo ln -sf "${INSTALL_PREFIX}/etc/datacrumbs/systemd/datacrumbs@.service" /etc/systemd/system/datacrumbs@.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now datacrumbs_probe_manager.service
+          sudo systemctl status --no-pager datacrumbs_probe_manager.service
+
+      - name: Generate probes
+        run: |
+          set -euo pipefail
+          set -x
+          test -x "${INSTALL_PREFIX}/bin/datacrumbs_configure_template"
+          config_template_yaml="${INSTALLED_CONFIG_TEMPLATE_YAML}"
+          if [[ ! -f "${config_template_yaml}" ]]; then
+            config_template_yaml="${CONFIG_TEMPLATE_YAML}"
+          fi
+          test -f "${config_template_yaml}"
+          rm -f "${CONFIG_YAML}"
+          "${INSTALL_PREFIX}/bin/datacrumbs_configure_template" "${config_template_yaml}" "${CONFIG_YAML}"
+          test -f "${CONFIG_YAML}"
+          rm -f "${PROBE_FILE}"
+          probe_dir="$(dirname "${PROBE_FILE}")"
+          fallback_probe_file=""
+
+          set +e
+          probe_output="$("${INSTALL_PREFIX}/bin/datacrumbs_probe_configurator" "${CONFIG_YAML}" "${PROBE_FILE}" 2>&1)"
+          probe_status=$?
+          set -e
+          printf '%s\n' "${probe_output}"
+          printf 'datacrumbs_probe_configurator exit status: %s\n' "${probe_status}"
+
+          if [[ ! -s "${PROBE_FILE}" ]]; then
+            set +e
+            fallback_probe_file="$(find "${probe_dir}" -maxdepth 1 -name 'probes-*.json.gz' -size +0c -print | sort | tail -n 1)"
+            set -e
+            if [[ -n "${fallback_probe_file}" ]]; then
+              cp "${fallback_probe_file}" "${PROBE_FILE}"
+              echo "Using generated fallback probes file: ${fallback_probe_file}"
+            fi
+          fi
+
+          if [[ "${probe_status}" != "0" ]]; then
+            if [[ "${probe_status}" == "1" ]] && grep -Eq "One or more probes failed validation|Extraction summary: .*invalid=yes" <<<"${probe_output}"; then
+              if [[ -s "${PROBE_FILE}" ]]; then
+                echo "Continuing with generated probes file despite invalid candidate probes on this runner."
+                ls -l "${probe_dir}"
+                find "${probe_dir}" -maxdepth 1 \( -name 'probes-*.json' -o -name 'probes-*.json.gz' -o -name 'categories-*.json' \) -print || true
+              else
+                echo "Probe validation reported invalid candidates and no probes file was written."
+                ls -l "${probe_dir}"
+                find "${probe_dir}" -maxdepth 1 \( -name 'probes-*.json' -o -name 'probes-*.json.gz' -o -name 'categories-*.json' \) -print || true
+                exit "${probe_status}"
+              fi
+            else
+              echo "Probe generation failed unexpectedly."
+              ls -l "${probe_dir}"
+              find "${probe_dir}" -maxdepth 1 \( -name 'probes-*.json' -o -name 'probes-*.json.gz' -o -name 'categories-*.json' \) -print || true
+              exit "${probe_status}"
+            fi
+          else
+            test -s "${PROBE_FILE}"
+          fi
+
+          set +x
+
+      - name: Run datacrumbs wrapper flow and verify logs
+        run: |
+          set -euo pipefail
+          service_user="${USER}"
+          log_file="${LOG_DIR}/datacrumbs_${service_user}_${JOB_ID}_$(hostname).log"
+
+          cleanup() {
+            "${INSTALL_PREFIX}/bin/datacrumbs_service_wrapper" stop "${JOB_ID}" "${service_user}" "${PROBE_FILE}" || true
+            sudo systemctl status --no-pager "datacrumbs@${JOB_ID}.service" || true
+            sudo journalctl -u "datacrumbs@${JOB_ID}.service" --no-pager -n 200 || true
+            sudo journalctl -u datacrumbs_probe_manager.service --no-pager -n 200 || true
+          }
+          trap cleanup EXIT
+
+          rm -f "${OUT_FILE}"
+          set +e
+          timeout --signal=TERM --kill-after=10s 60s \
+            "${INSTALL_PREFIX}/bin/datacrumbs_service_wrapper" start "${JOB_ID}" "${service_user}" "${PROBE_FILE}"
+          start_status=$?
+          set -e
+
+          if [[ "${start_status}" -eq 124 ]]; then
+            echo "datacrumbs_service_wrapper start timed out after 60s; dumping diagnostics"
+            if [[ -f "${log_file}" ]]; then
+              echo "---- datacrumbs log (tail -n 200): ${log_file} ----"
+              tail -n 200 "${log_file}" || true
+            fi
+            sudo systemctl status --no-pager "datacrumbs@${JOB_ID}.service" || true
+            sudo journalctl -u "datacrumbs@${JOB_ID}.service" --no-pager -n 200 || true
+            sudo journalctl -u datacrumbs_probe_manager.service --no-pager -n 200 || true
+            exit 124
+          fi
+
+          if [[ "${start_status}" -ne 0 ]]; then
+            echo "datacrumbs_service_wrapper start failed with status ${start_status}; dumping diagnostics"
+            if [[ -f "${log_file}" ]]; then
+              echo "---- datacrumbs log (tail -n 200): ${log_file} ----"
+              tail -n 200 "${log_file}" || true
+            fi
+            sudo systemctl status --no-pager "datacrumbs@${JOB_ID}.service" || true
+            sudo journalctl -u "datacrumbs@${JOB_ID}.service" --no-pager -n 200 || true
+            sudo journalctl -u datacrumbs_probe_manager.service --no-pager -n 200 || true
+            exit "${start_status}"
+          fi
+
+          sudo systemctl is-active --quiet "datacrumbs@${JOB_ID}.service"
+
+          set +e
+          timeout --signal=TERM --kill-after=10s 60s \
+            "${INSTALL_PREFIX}/bin/datacrumbs_wrap" \
+            dd if=/dev/zero of="${OUT_FILE}" bs=1M count=16 status=none
+          wrap_status=$?
+          set -e
+
+          if [[ "${wrap_status}" -eq 124 ]]; then
+            echo "datacrumbs_wrap timed out after 60s; dumping diagnostics"
+            sudo systemctl status --no-pager "datacrumbs@${JOB_ID}.service" || true
+            sudo journalctl -u "datacrumbs@${JOB_ID}.service" --no-pager -n 200 || true
+            sudo journalctl -u datacrumbs_probe_manager.service --no-pager -n 200 || true
+            exit 124
+          fi
+
+          if [[ "${wrap_status}" -ne 0 ]]; then
+            echo "datacrumbs_wrap failed with status ${wrap_status}; dumping diagnostics"
+            sudo systemctl status --no-pager "datacrumbs@${JOB_ID}.service" || true
+            sudo journalctl -u "datacrumbs@${JOB_ID}.service" --no-pager -n 200 || true
+            sudo journalctl -u datacrumbs_probe_manager.service --no-pager -n 200 || true
+            exit "${wrap_status}"
+          fi
+
+          test -f "${OUT_FILE}"
+          test "$(wc -c <"${OUT_FILE}")" = "16777216"
+
+          sleep 5
+          "${INSTALL_PREFIX}/bin/datacrumbs_service_wrapper" stop "${JOB_ID}" "${service_user}" "${PROBE_FILE}"
+          trap - EXIT
+
+          final_log_file="${log_file}"
+          if [[ ! -s "${final_log_file}" ]]; then
+            fallback_log_file="$(find "${LOG_DIR}" -maxdepth 1 -type f -name "datacrumbs_${service_user}_${JOB_ID}_*.log" -print | sort | tail -n 1 || true)"
+            if [[ -n "${fallback_log_file}" ]]; then
+              final_log_file="${fallback_log_file}"
+            fi
+          fi
+
+          echo "Final datacrumbs log directory snapshot (${LOG_DIR}):"
+          ls -la "${LOG_DIR}" || true
+          if [[ -f "${final_log_file}" ]]; then
+            echo "---- final datacrumbs log (tail -n 200): ${final_log_file} ----"
+            tail -n 200 "${final_log_file}" || true
+          else
+            echo "No datacrumbs log file found to print at end of run."
+          fi
+
+          ! sudo systemctl is-active --quiet "datacrumbs@${JOB_ID}.service"
+          test -s "${final_log_file}"
+          grep -q . "${final_log_file}"
+
+      - name: Upload datacrumbs logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datacrumbs-${{ matrix.os_name }}-${{ matrix.flow_id }}-logs
+          path: |
+            /tmp/datacrumbs-logs
+            /tmp/datacrumbs-traces
+            /tmp/datacrumbs-ci-probes.json.gz
+            /tmp/datacrumbs-ci-output.bin
+          if-no-files-found: ignore

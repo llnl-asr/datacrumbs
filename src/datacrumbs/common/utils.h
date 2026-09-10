@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #pragma once
 // include first
 #include <datacrumbs/datacrumbs_config.h>
@@ -10,13 +13,19 @@
 namespace datacrumbs {
 namespace utils {
 
-// Base64 encoding table (URL-safe, no special characters)
+/**
+ * @brief URL-safe base64 alphabet used by encode/decode helpers.
+ */
 static const std::string base64_chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "abcdefghijklmnopqrstuvwxyz"
     "0123456789-_";
 
-// Check if a character is base64 (URL-safe)
+/**
+ * @brief Check if a character is valid for URL-safe base64 alphabet.
+ * @param c Input character byte.
+ * @return True when valid base64 alphabet character.
+ */
 inline bool is_base64(unsigned char c) {
   DC_LOG_TRACE("Entering is_base64 with char: %c", c);
   bool result = (isalnum(c) || (c == '-') || (c == '_'));
@@ -25,7 +34,11 @@ inline bool is_base64(unsigned char c) {
   return result;
 }
 
-// Encode a byte vector to base64 string (URL-safe, no special chars)
+/**
+ * @brief Encode bytes into URL-safe base64 string without '=' padding.
+ * @param bytes_to_encode Input byte vector.
+ * @return Encoded base64 string.
+ */
 inline std::string base64_encode(const std::vector<unsigned char>& bytes_to_encode) {
   DC_LOG_TRACE("Start base64_encode, input size: %zu", bytes_to_encode.size());
   std::string ret;
@@ -67,7 +80,11 @@ inline std::string base64_encode(const std::vector<unsigned char>& bytes_to_enco
   return ret;
 }
 
-// Decode a base64 string to byte vector (URL-safe, no special chars)
+/**
+ * @brief Decode URL-safe base64 string into bytes.
+ * @param encoded_string URL-safe base64 input.
+ * @return Decoded bytes (possibly empty on invalid/empty input).
+ */
 inline std::vector<unsigned char> base64_decode(const std::string& encoded_string) {
   DC_LOG_TRACE("Start base64_decode, input size: %zu", encoded_string.size());
   int in_len = encoded_string.size();
@@ -112,22 +129,32 @@ inline std::vector<unsigned char> base64_decode(const std::string& encoded_strin
   return ret;
 }
 
-// Timer class for measuring elapsed time between code segments
+/**
+ * @brief Simple cumulative wall-clock timer utility.
+ */
 class Timer {
  public:
+  /**
+   * @brief Construct timer with zero elapsed time.
+   */
   Timer() : elapsed_time(0) {
     // Trace constructor entry
     DC_LOG_TRACE("Timer constructed, elapsed_time initialized to 0");
   }
 
-  // Resume or start the timer
+  /**
+   * @brief Resume/start measuring elapsed time segment.
+   */
   void resumeTime() {
     DC_LOG_TRACE("Timer::resumeTime called");
     t1 = std::chrono::high_resolution_clock::now();
     DC_LOG_DEBUG("Timer resumed at current time point");
   }
 
-  // Pause the timer and accumulate elapsed time
+  /**
+   * @brief Pause timer and accumulate segment elapsed time.
+   * @return Total accumulated elapsed time in seconds.
+   */
   double pauseTime() {
     DC_LOG_TRACE("Timer::pauseTime called");
     auto t2 = std::chrono::high_resolution_clock::now();
@@ -138,7 +165,10 @@ class Timer {
     return elapsed_time;
   }
 
-  // Get the total elapsed time
+  /**
+   * @brief Get total accumulated elapsed time.
+   * @return Total elapsed seconds.
+   */
   double getElapsedTime() {
     DC_LOG_TRACE("Timer::getElapsedTime called");
     DC_LOG_DEBUG("Returning elapsed_time: %f seconds", elapsed_time);
@@ -146,11 +176,17 @@ class Timer {
   }
 
  private:
-  std::chrono::high_resolution_clock::time_point t1;  // Last start/resume time
-  double elapsed_time;                                // Accumulated elapsed time in seconds
+  /// Last resume/start timestamp.
+  std::chrono::high_resolution_clock::time_point t1;
+  /// Accumulated elapsed duration in seconds.
+  double elapsed_time;
 };
 
-// Function to remove non-UTF8 characters from a string
+/**
+ * @brief Remove invalid UTF-8 sequences and unsafe filename/path characters.
+ * @param input Source string.
+ * @return Sanitized string.
+ */
 inline std::string remove_non_utf8(const std::string& input) {
   DC_LOG_TRACE("Start remove_non_utf8, input size: %zu", input.size());
   std::string result;

@@ -1,0 +1,10 @@
+#ifndef DATACRUMBS_CUSTOM_PROBES_PROCESS_H
+#define DATACRUMBS_CUSTOM_PROBES_PROCESS_H
+
+/*
+ * Site-local userspace processing hooks that can be enabled by uncommenting the
+ * generated includes below.
+ */
+// #include "@CMAKE_CURRENT_SOURCE_DIR@/etc/datacrumbs/plugins/custom_probes/sys_io/sysio_process.h"
+
+#endif

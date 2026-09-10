@@ -1,10 +1,13 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #ifndef DATACRUMBS_SERVER_BPF_MACROS_BPF_H
 #define DATACRUMBS_SERVER_BPF_MACROS_BPF_H
 
 #include <datacrumbs/server/bpf/shared.h>
 
 /**
- * Macros for defining BPF ring buffers
+ * @brief Macro set for defining BPF ring buffers and maps.
  */
 #define DATACRUMBS_BPF_RING_BUF_1_ARGS(name) \
   struct {                                   \
@@ -25,7 +28,7 @@
 #define DATACRUMBS_RINGBUF(...) DATACRUMBS_BPF_RING_BUF_MACRO_CHOOSER(__VA_ARGS__)(__VA_ARGS__)
 
 /**
- * Macro for defining a BPF map
+ * @brief Macro set for defining hash maps with optional max_entries.
  */
 
 #define DATACRUMBS_MAP_3_ARGS(name, map_key, map_value) \
@@ -76,7 +79,7 @@
 #define DATACRUMBS_TRIE(...) DATACRUMBS_TRIE_MACRO_CHOOSER(__VA_ARGS__)(__VA_ARGS__)
 
 /**
- * Macros for defining BPF ring buffers
+ * @brief Macro set for declaring extern ring buffers.
  */
 #define DATACRUMBS_BPF_RING_BUF_EXTERN_1_ARGS(name) \
   extern struct {                                   \
@@ -97,7 +100,7 @@
   DATACRUMBS_BPF_RING_BUF_EXTERN_MACRO_CHOOSER(__VA_ARGS__)(__VA_ARGS__)
 
 /**
- * Macro for defining a BPF map
+ * @brief Macro set for declaring extern hash maps.
  */
 
 #define DATACRUMBS_MAP_EXTERN_3_ARGS(name, map_key, map_value) \
@@ -145,7 +148,7 @@
 #define DATACRUMBS_TRIE_EXTERN(...) DATACRUMBS_TRIE_EXTERN_MACRO_CHOOSER(__VA_ARGS__)(__VA_ARGS__)
 
 /**
- * Helper Macros
+ * @brief Small helper macros used by BPF templates.
  */
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)

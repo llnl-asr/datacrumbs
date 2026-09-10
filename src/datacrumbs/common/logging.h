@@ -1,14 +1,19 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #pragma once
-// include first
+
 #include <datacrumbs/datacrumbs_config.h>
-// std headers
+
 #include <chrono>
-#include <fstream>
-#include <iostream>
+#include <cstdarg>
+#include <cstdio>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-// Logging levels
 #define LOG_LEVEL_PRINT 0
 #define LOG_LEVEL_ERROR 1
 #define LOG_LEVEL_WARN 2
@@ -16,14 +21,44 @@
 #define LOG_LEVEL_DEBUG 4
 #define LOG_LEVEL_TRACE 5
 
-#include <cstdarg>
-#include <vector>
-
 namespace datacrumbs::logging_internal {
 
+/// Default interval for progress status emission.
+inline constexpr std::chrono::seconds kDefaultProgressLogInterval{5};
+
+/**
+ * @brief Mutable per-key progress bookkeeping state.
+ */
+struct ProgressState {
+  /// First observation timestamp for this progress key.
+  std::chrono::steady_clock::time_point start_time;
+  /// Last time a progress line was emitted.
+  std::chrono::steady_clock::time_point last_emit_time;
+  /// Last seen numeric value.
+  size_t last_value = 0;
+  /// Whether state has been initialized.
+  bool initialized = false;
+};
+
+/**
+ * @brief Snapshot returned from state update to decide whether to emit logs.
+ */
+struct ProgressSnapshot {
+  /// Whether caller should emit a progress line.
+  bool should_emit = false;
+  /// Time elapsed since the tracked operation started.
+  std::chrono::duration<double> elapsed{0.0};
+  /// Average processing rate.
+  double rate = 0.0;
+};
+
+/**
+ * @brief Resolve output stream for logging.
+ * @return FILE handle for active sink.
+ */
 inline FILE* get_log_file() {
 #ifdef LOG_TO_FILE
-  static FILE* file = fopen(LOG_FILE_PATH, "a");
+  static FILE* file = std::fopen(LOG_FILE_PATH, "a");
   return file;
 #else
   return stdout;
@@ -35,86 +70,240 @@ inline std::mutex& get_log_mutex() {
   return mtx;
 }
 
-// Default formatter: just joins messages with spaces
-inline std::string default_formatter(const std::vector<std::string>& messages) {
-  std::string result;
-  for (size_t i = 0; i < messages.size(); ++i) {
-    if (i > 0) result += " ";
-    result += messages[i];
+inline std::mutex& get_progress_mutex() {
+  static std::mutex mtx;
+  return mtx;
+}
+
+inline std::unordered_map<std::string, ProgressState>& get_progress_states() {
+  static std::unordered_map<std::string, ProgressState> states;
+  return states;
+}
+
+inline std::string format_message(const char* fmt, va_list args) {
+  va_list args_copy;
+  va_copy(args_copy, args);
+  const int required = std::vsnprintf(nullptr, 0, fmt, args_copy);
+  va_end(args_copy);
+
+  if (required <= 0) {
+    return {};
+  }
+
+  std::vector<char> buffer(static_cast<size_t>(required) + 1);
+  std::vsnprintf(buffer.data(), buffer.size(), fmt, args);
+  return std::string(buffer.data(), static_cast<size_t>(required));
+}
+
+inline void write_log_line(const char* level, const std::string& message) {
+  std::lock_guard<std::mutex> lock(get_log_mutex());
+  FILE* out = get_log_file();
+  std::fprintf(out, "[%s] %s\n", level, message.c_str());
+  std::fflush(out);
+}
+
+inline void write_log_fragment(const std::string& message) {
+  std::lock_guard<std::mutex> lock(get_log_mutex());
+  FILE* out = get_log_file();
+  std::fputs(message.c_str(), out);
+  std::fflush(out);
+}
+
+inline void log_message_fmt(const char* level, const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  const std::string message = format_message(fmt, args);
+  va_end(args);
+  write_log_line(level, message);
+}
+
+inline void log_message_fmt_no_new_line(const char* /*level*/, const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  const std::string message = format_message(fmt, args);
+  va_end(args);
+  write_log_fragment(message);
+}
+
+template <typename... Args>
+inline void log_message(const char* level, const char* fmt, Args&&... args) {
+  log_message_fmt(level, fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+inline void log_message_no_new_line(const char* level, const char* fmt, Args&&... args) {
+  log_message_fmt_no_new_line(level, fmt, std::forward<Args>(args)...);
+}
+
+inline std::string format_compact_count(double value) {
+  const char* suffix = "";
+  if (value >= 1e9) {
+    value /= 1e9;
+    suffix = "G";
+  } else if (value >= 1e6) {
+    value /= 1e6;
+    suffix = "M";
+  } else if (value >= 1e3) {
+    value /= 1e3;
+    suffix = "K";
+  }
+
+  char buffer[64];
+  std::snprintf(buffer, sizeof(buffer), "%.2f%s", value, suffix);
+  std::string result(buffer);
+  if (const auto dot = result.find('.'); dot != std::string::npos) {
+    while (!result.empty() && result.back() == '0') {
+      result.pop_back();
+    }
+    if (!result.empty() && result.back() == '.') {
+      result.pop_back();
+    }
   }
   return result;
 }
 
-// Variadic template to accept any number of messages
-inline void log_message_fmt(const char* level, const char* fmt, ...) {
-  FILE* out = get_log_file();
+/**
+ * @brief Render an elapsed duration as "1h 2m 3s", "2m 3s" or "3.21s".
+ *
+ * Units are split with duration_cast rather than by dividing a seconds count,
+ * so the conversion factors are supplied and checked by the type system instead
+ * of appearing as literals. duration_cast truncates toward zero, which is what
+ * the whole-unit fields want.
+ *
+ * @param elapsed Duration to render. Example: 90s renders as "1m 30s".
+ * @return Formatted duration string.
+ */
+inline std::string format_elapsed(std::chrono::duration<double> elapsed) {
+  char buffer[64];
+  const auto hours = std::chrono::duration_cast<std::chrono::hours>(elapsed);
+  const auto minutes = std::chrono::duration_cast<std::chrono::minutes>(elapsed - hours);
+  const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed - hours - minutes);
 
-  constexpr size_t buf_size = 1024;
-  char buffer[buf_size];
-
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(buffer, buf_size, fmt, args);
-  va_end(args);
-
-  fprintf(out, "[%s] %s\n", level, buffer);
-  fflush(out);
+  if (hours.count() > 0) {
+    std::snprintf(buffer, sizeof(buffer), "%lldh %lldm %llds",
+                  static_cast<long long>(hours.count()), static_cast<long long>(minutes.count()),
+                  static_cast<long long>(seconds.count()));
+  } else if (minutes.count() > 0) {
+    std::snprintf(buffer, sizeof(buffer), "%lldm %llds", static_cast<long long>(minutes.count()),
+                  static_cast<long long>(seconds.count()));
+  } else {
+    std::snprintf(buffer, sizeof(buffer), "%.2fs", elapsed.count());
+  }
+  return buffer;
 }
 
-inline void log_message_fmt_no_new_line(const char* level, const char* fmt, ...) {
-  FILE* out = get_log_file();
+inline ProgressSnapshot update_progress_state(const std::string& key, size_t current,
+                                              std::chrono::steady_clock::duration min_interval,
+                                              bool completed) {
+  using clock = std::chrono::steady_clock;
 
-  constexpr size_t buf_size = 1024;
-  char buffer[buf_size];
+  const auto now = clock::now();
+  std::lock_guard<std::mutex> lock(get_progress_mutex());
+  auto& states = get_progress_states();
+  auto& state = states[key];
 
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(buffer, buf_size, fmt, args);
-  va_end(args);
+  if (!state.initialized || current < state.last_value) {
+    state.start_time = now;
+    state.last_emit_time = now;
+    state.last_value = 0;
+    state.initialized = true;
+  }
 
-  fprintf(out, "%s", buffer);
-  fflush(out);
+  if (!completed && (now - state.last_emit_time) < min_interval) {
+    state.last_value = current;
+    return {};
+  }
+
+  ProgressSnapshot snapshot;
+  snapshot.should_emit = true;
+  snapshot.elapsed =
+      std::chrono::duration_cast<std::chrono::duration<double>>(now - state.start_time);
+  snapshot.rate = snapshot.elapsed.count() > 0.0
+                      ? static_cast<double>(current) / snapshot.elapsed.count()
+                      : 0.0;
+
+  if (completed) {
+    states.erase(key);
+  } else {
+    state.last_emit_time = now;
+    state.last_value = current;
+  }
+
+  return snapshot;
 }
 
-// Overload for default formatter
-template <typename... Args>
-inline void log_message(const char* level, const char* fmt, Args&&... args) {
-  logging_internal::log_message_fmt(level, fmt, std::forward<Args>(args)...);
-}
-template <typename... Args>
-inline void log_message_no_new_line(const char* level, const char* fmt, Args&&... args) {
-  logging_internal::log_message_fmt_no_new_line(level, fmt, std::forward<Args>(args)...);
-}
-
-// Trace-level logging with file and line info
-#if DATACRUMBS_LOG_LEVEL >= LOG_LEVEL_DEBUG
-inline void log_message_trace(const char* level, const char* file, int line, const char* fmt, ...) {
-  FILE* out = get_log_file();
-
-  constexpr size_t buf_size = 1024;
-  char buffer[buf_size];
-
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(buffer, buf_size, fmt, args);
-  va_end(args);
-
-  fprintf(out, "[%s] %s (%s:%d)\n", level, buffer, file, line);
-  fflush(out);
-}
+inline void emit_progress_line(const std::string& message) {
+#ifdef LOG_TO_FILE
+  write_log_line("PRINT", message);
+#else
+  write_log_fragment("\r" + message);
 #endif
+}
+
+inline void finish_console_progress_line() {
+#ifndef LOG_TO_FILE
+  write_log_line("PRINT", "");
+#endif
+}
+
+/**
+ * @brief Emit aggregated progress information with total count.
+ * @param message Progress message key.
+ * @param current Current completed count.
+ * @param total Total expected count.
+ * @param min_interval Minimum time between emissions.
+ */
+inline void log_progress(
+    const std::string& message, size_t current, size_t total,
+    std::chrono::steady_clock::duration min_interval = kDefaultProgressLogInterval) {
+  const bool completed = total > 0 && current >= total;
+  const ProgressSnapshot snapshot =
+      update_progress_state(message, current, min_interval, completed);
+  if (!snapshot.should_emit) {
+    return;
+  }
+
+  const double percent =
+      total > 0 ? (100.0 * static_cast<double>(current) / static_cast<double>(total)) : 0.0;
+  const std::string line = message + " [" + std::to_string(current) + "/" + std::to_string(total) +
+                           "] " + std::to_string(static_cast<int>(percent)) + "% completed | " +
+                           format_elapsed(snapshot.elapsed) + " elapsed | " +
+                           format_compact_count(snapshot.rate) + " events/s";
+  emit_progress_line(line);
+
+  if (completed) {
+    finish_console_progress_line();
+    write_log_line("PRINT", message + " done. Total time: " + format_elapsed(snapshot.elapsed) +
+                                ", Avg rate: " + format_compact_count(snapshot.rate) + " events/s");
+  }
+}
+
+/**
+ * @brief Emit open-ended progress information without total.
+ * @param message Progress message key.
+ * @param current Current processed count.
+ * @param min_interval Minimum time between emissions.
+ */
+inline void log_progress(
+    const std::string& message, size_t current,
+    std::chrono::steady_clock::duration min_interval = kDefaultProgressLogInterval) {
+  const ProgressSnapshot snapshot = update_progress_state(message, current, min_interval, false);
+  if (!snapshot.should_emit) {
+    return;
+  }
+
+  const std::string line = message + " [" + format_compact_count(static_cast<double>(current)) +
+                           " events] | " + format_elapsed(snapshot.elapsed) + " elapsed | " +
+                           format_compact_count(snapshot.rate) + " events/s";
+  emit_progress_line(line);
+}
 
 }  // namespace datacrumbs::logging_internal
 
-#if 1
 #define DC_LOG_PRINT(...) datacrumbs::logging_internal::log_message("PRINT", __VA_ARGS__)
 #define DC_LOG_PRINT_NO_NEW_LINE(...) \
   datacrumbs::logging_internal::log_message_no_new_line("PRINT", __VA_ARGS__)
-#else
-#define DC_LOG_PRINT(...) (void)0
-#endif
 
-// Macros for logging
 #if DATACRUMBS_LOG_LEVEL >= LOG_LEVEL_ERROR
 #define DC_LOG_ERROR(...) datacrumbs::logging_internal::log_message("ERROR", __VA_ARGS__)
 #else
@@ -145,127 +334,16 @@ inline void log_message_trace(const char* level, const char* file, int line, con
 #define DC_LOG_TRACE(...) (void)0
 #endif
 
-namespace datacrumbs::logging_internal {
-
-inline void log_progress(const std::string& message, size_t current, size_t total) {
-  using namespace std::chrono;
-  static auto start_time = steady_clock::now();
-  static size_t last_printed = 0;
-  constexpr size_t PRINT_INTERVAL = 10000;  // Print every 10K events
-
-  // Only print every PRINT_INTERVAL events or when done
-  if (current != total && (current - last_printed) < PRINT_INTERVAL) {
-    return;
-  }
-
-  last_printed = current;
-
-  float percent = (total > 0) ? (100.0f * current / total) : 0.0f;
-  auto now = steady_clock::now();
-  double elapsed = duration_cast<duration<double>>(now - start_time).count();
-  double rate = (elapsed > 0.0) ? (current / elapsed) : 0.0;
-
-#ifdef LOG_TO_FILE
-  // For file logging, write complete lines without \r to avoid log file bloat
-  DC_LOG_PRINT("%s [%zu/%zu] %d%% completed | %.2fs elapsed | %.2f events/s", message.c_str(),
-               current, total, static_cast<int>(percent), elapsed, rate);
-#else
-  // For console logging, use \r for in-place updates
-  DC_LOG_PRINT_NO_NEW_LINE("\r%s [%zu/%zu] %d%% completed | %.2fs elapsed | %.2f events/s",
-                           message.c_str(), current, total, static_cast<int>(percent), elapsed,
-                           rate);
-#endif
-
-  if (current == total) {
-#ifndef LOG_TO_FILE
-    DC_LOG_PRINT("");  // Print newline to finish the progress line
-#endif
-    DC_LOG_PRINT("%s done. Total time: %.2fs, Avg rate: %.2f events/s", message.c_str(), elapsed,
-                 rate);
-    start_time = steady_clock::now();  // Reset for next progress
-    last_printed = 0;
-  }
-}
-
-inline void log_progress(const std::string& message, size_t current) {
-  using namespace std::chrono;
-  static auto start_time = steady_clock::now();
-  static std::mutex mtx;
-  static size_t last_printed = 0;
-  constexpr size_t PRINT_INTERVAL = 10000;  // Print every 10K events
-
-  // Only print every PRINT_INTERVAL events
-  if ((current - last_printed) < PRINT_INTERVAL) {
-    return;
-  }
-
-  last_printed = current;
-
-  auto now = steady_clock::now();
-  double elapsed = duration_cast<duration<double>>(now - start_time).count();
-  double rate = (elapsed > 0.0) ? (current / elapsed) : 0.0;
-  std::string rate_str;
-  std::string multiplier;
-  if (rate >= 1e9) {
-    rate_str = std::to_string(rate / 1e9) + "G";
-    multiplier = "G";
-  } else if (rate >= 1e6) {
-    rate_str = std::to_string(rate / 1e6) + "M";
-    multiplier = "M";
-  } else if (rate >= 1e3) {
-    rate_str = std::to_string(rate / 1e3) + "K";
-    multiplier = "K";
-  } else {
-    rate_str = std::to_string(rate);
-    multiplier = "";
-  }
-
-  rate_str.resize(rate_str.find('.') != std::string::npos ? rate_str.find('.') + 3
-                                                          : rate_str.size());
-  rate_str += multiplier;
-  int hours = static_cast<int>(elapsed) / 3600;
-  int minutes = (static_cast<int>(elapsed) % 3600) / 60;
-  int seconds = static_cast<int>(elapsed) % 60;
-  char elapsed_str[32];
-  if (hours > 0)
-    snprintf(elapsed_str, sizeof(elapsed_str), "%dh %dm %ds", hours, minutes, seconds);
-  else if (minutes > 0)
-    snprintf(elapsed_str, sizeof(elapsed_str), "%dm %ds", minutes, seconds);
-  else
-    snprintf(elapsed_str, sizeof(elapsed_str), "%.2fs", elapsed);
-  std::string current_str;
-  if (current >= 1e9) {
-    current_str = std::to_string(static_cast<double>(current) / 1e9) + "G";
-    multiplier = "G";
-  } else if (current >= 1e6) {
-    multiplier = "M";
-    current_str = std::to_string(static_cast<double>(current) / 1e6) + "M";
-  } else if (current >= 1e3) {
-    multiplier = "K";
-    current_str = std::to_string(static_cast<double>(current) / 1e3) + "K";
-  } else {
-    current_str = std::to_string(current);
-    multiplier = "";
-  }
-  current_str.resize(current_str.find('.') != std::string::npos ? current_str.find('.') + 3
-                                                                : current_str.size());
-  current_str += multiplier;
-
-#ifdef LOG_TO_FILE
-  // For file logging, write complete lines without \r to avoid log file bloat
-  DC_LOG_PRINT("%s [%s events] | %s elapsed | %s events/s", message.c_str(), current_str.c_str(),
-               elapsed_str, rate_str.c_str());
-#else
-  // For console logging, use \r for in-place updates
-  DC_LOG_PRINT_NO_NEW_LINE(
-      "\r                            \r%s [%s events] | %s elapsed | %s events/s    ",
-      message.c_str(), current_str.c_str(), elapsed_str, rate_str.c_str());
-#endif
-}
-}  // namespace datacrumbs::logging_internal
-// Progress logging macro
 #define DC_LOG_PROGRESS(message, current, total) \
-  datacrumbs::logging_internal::log_progress(message, current, total)
+  DC_LOG_PROGRESS_THROTTLED(message, current, total, 5)
 
 #define DC_LOG_PROGRESS_SINGLE(message, current) \
-  datacrumbs::logging_internal::log_progress(message, current)
+  DC_LOG_PROGRESS_SINGLE_THROTTLED(message, current, 5)
+
+#define DC_LOG_PROGRESS_THROTTLED(message, current, total, interval_seconds) \
+  datacrumbs::logging_internal::log_progress(                                \
+      message, current, total, std::chrono::seconds(static_cast<long long>(interval_seconds)))
+
+#define DC_LOG_PROGRESS_SINGLE_THROTTLED(message, current, interval_seconds) \
+  datacrumbs::logging_internal::log_progress(                                \
+      message, current, std::chrono::seconds(static_cast<long long>(interval_seconds)))

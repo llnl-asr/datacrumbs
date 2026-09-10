@@ -1,0 +1,13 @@
+[Unit]
+Description=Datacrumbs trusted probe manager service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=@DATACRUMBS_INSTALL_SBINARYDIR@/datacrumbs_probe_manager
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

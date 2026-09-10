@@ -1,9 +1,0 @@
-capture_probes:
-  - name: custom1
-    start_event_id: 100000
-    probe: custom
-    type: custom
-    file: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/sys_io/sysio.bpf.c
-    probes: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/sys_io/probes.json
-    process_header: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/sys_io/sysio_process.h
-    event_type: 2

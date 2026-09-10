@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 #pragma once
 // Generated Headers
 #include <datacrumbs/datacrumbs_config.h>
@@ -12,8 +15,18 @@
 #include <vector>
 
 namespace datacrumbs {
+
+/**
+ * @brief Buffered gzip compressor for streaming trace output.
+ */
 class ZlibCompression {
  public:
+  /**
+   * @brief Create gzip compressor bound to output file.
+   * @param output_file Destination gzip file path.
+   * @param chunk_size Buffer chunk size for batched writes.
+   * @throws std::runtime_error on file open or zlib init failure.
+   */
   ZlibCompression(const std::string& output_file, size_t chunk_size)
       : output_file_(output_file), chunk_size_(chunk_size), buffer_(chunk_size) {
     file_ = std::fopen(output_file_.c_str(), "wb");
@@ -33,6 +46,9 @@ class ZlibCompression {
 
   ~ZlibCompression() {}
 
+  /**
+   * @brief Finalize stream, flush remaining bytes, and close output file.
+   */
   void finalize() {
     DC_LOG_DEBUG("Finalizing compression");
     flush();
@@ -44,6 +60,11 @@ class ZlibCompression {
     DC_LOG_DEBUG("Compression finalized");
   }
 
+  /**
+   * @brief Compress one data chunk into output stream.
+   * @param data Plain-text payload chunk.
+   * @throws std::runtime_error on zlib compression failure.
+   */
   void compress(const std::string& data) {
     DC_LOG_DEBUG("Compressing data of size: %zu bytes", data.size());
     strm_.avail_in = static_cast<uInt>(data.size());
@@ -64,6 +85,9 @@ class ZlibCompression {
     }
   }
 
+  /**
+   * @brief Flush pending compressed bytes and finish zlib stream.
+   */
   void flush() {
     int ret;
     do {
@@ -84,6 +108,7 @@ class ZlibCompression {
   }
 
  private:
+  /// Write current compressed buffer to file.
   void write_chunk() {
     if (buffer_offset_ > 0 && file_) {
       if (std::fwrite(buffer_.data(), 1, buffer_offset_, file_) != buffer_offset_) {
@@ -95,11 +120,17 @@ class ZlibCompression {
     }
   }
 
+  /// Output gzip file path.
   std::string output_file_;
+  /// Compression chunk size.
   size_t chunk_size_;
+  /// Intermediate compressed data buffer.
   std::vector<uint8_t> buffer_;
+  /// Current write offset into buffer_.
   size_t buffer_offset_;
+  /// Output file handle.
   FILE* file_;
+  /// zlib deflate stream state.
   z_stream strm_;
 };
 }  // namespace datacrumbs

@@ -1,20 +1,36 @@
+// SPDX-License-Identifier: MIT
+// Owner: hariharandev1@llnl.gov
+
 // Internal headers
 #include <datacrumbs/common/enumerations.h>
+#include <datacrumbs/common/runtime_configuration_manager.h>
+#include <datacrumbs/common/singleton.h>
 #include <datacrumbs/server/process/event_processor.h>
-// dependent headers
-#include <mpi.h>
+
+#include <unordered_map>
+#include <unordered_set>
+
 // std headers
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 
-// Custom libbpf print function for debugging
 static int libbpf_print_fn(enum libbpf_print_level level, const char* format, va_list args) {
   if (level >= LIBBPF_DEBUG) return 0;
   return vfprintf(stderr, format, args);
 }
 
+static bool is_char_pointer_type(const std::string& c_type) {
+  return c_type.find("char *") != std::string::npos ||
+         c_type.find("const char *") != std::string::npos;
+}
+
 static int handle_event(void* ctx, void* data, size_t data_sz) {
-  datacrumbs::EventProcessor* event_processor = static_cast<datacrumbs::EventProcessor*>(ctx);
+  auto* event_processor = static_cast<datacrumbs::EventProcessor*>(ctx);
   return event_processor->handle_event(data, data_sz);
 }
 
@@ -24,371 +40,387 @@ inline static int lookup_and_delete(int map_fd, datacrumbs::EventProcessor* even
   int ret = bpf_map_lookup_and_delete_batch_compat(map_fd, in_batch, &in_batch, keys, values,
                                                    &batch_size, 0);
   if (ret < 0 && errno != ENOENT) {
-    perror("bpf_map_lookup_and_delete_batch fhash");
+    perror("bpf_map_lookup_and_delete_batch file_map");
     return -1;
   }
-  // Process the retrieved keys and values
-  for (int i = 0; i < batch_size; ++i) {
+  for (unsigned int i = 0; i < batch_size; ++i) {
     event_processor->update_filename(keys[i].str, values[i]);
   }
-  // Check if the end of the map has been reached
   if (ret < 0 && errno == ENOENT) {
     return 0;
   }
   return 1;
 }
 
-inline static int lookup(int map_fd, datacrumbs::EventProcessor* event_processor,
-                         struct string_t* keys, unsigned int* values, unsigned int batch_size,
-                         struct string_t* in_batch) {
-  int ret = bpf_map_lookup_batch_compat(map_fd, in_batch, &in_batch, keys, values, &batch_size, 0);
-  if (ret < 0 && errno != ENOENT) {
-    perror("bpf_map_lookup_batch  fhash");
-    return -1;
-  }
-  // Process the retrieved keys and values
-  for (int i = 0; i < batch_size; ++i) {
-    event_processor->update_filename(keys[i].str, values[i]);
-  }
-  // Check if the end of the map has been reached
-  if (ret < 0 && errno == ENOENT) {
-    return -1;
-  }
-  return 0;
-}
-
-// Setup signal handler for Ctrl-C (SIGINT)
 static volatile bool stop = false;
-// Define a signal handler function with C linkage
+
 static void sig_handler(int) {
   stop = true;
-  DC_LOG_INFO("\nReceived SIGINT, setting loop variable");
+  DC_LOG_INFO("\nReceived SIGINT, stopping server loop");
 }
 
-static int manual_probes(datacrumbs::EventProcessor* event_processor, struct datacrumbs_bpf* skel) {
-  auto config_manager = event_processor->configManager_;
-  struct json_object* manual_probes_json =
-      json_object_from_file(config_manager->manual_probe_path.c_str());
-  if (manual_probes_json) {
-    int total_manual_probes = 0, total_successful_probes = 0, total_failed_probes = 0;
-    int arr_len = json_object_array_length(manual_probes_json);
-    for (int i = 0; i < arr_len; i++) {
-      struct json_object* jprobe = json_object_array_get_idx(manual_probes_json, i);
-      if (jprobe) {
-        auto probe = datacrumbs::Probe::fromJson(jprobe);
-        std::shared_ptr<datacrumbs::Probe> manual_probe;
-        switch (probe.type) {
-          case datacrumbs::ProbeType::UPROBE:
-            manual_probe =
-                std::make_shared<datacrumbs::UProbe>(datacrumbs::UProbe::fromJson(jprobe));
-            break;
-          case datacrumbs::ProbeType::SYSCALLS:
-            manual_probe = std::make_shared<datacrumbs::SysCallProbe>(
-                datacrumbs::SysCallProbe::fromJson(jprobe));
-            break;
-          case datacrumbs::ProbeType::USDT:
-            manual_probe =
-                std::make_shared<datacrumbs::USDTProbe>(datacrumbs::USDTProbe::fromJson(jprobe));
-            break;
-          case datacrumbs::ProbeType::KPROBE:
-            manual_probe =
-                std::make_shared<datacrumbs::KProbe>(datacrumbs::KProbe::fromJson(jprobe));
-            break;
-          case datacrumbs::ProbeType::CUSTOM:
-            manual_probe = std::make_shared<datacrumbs::CustomProbe>(
-                datacrumbs::CustomProbe::fromJson(jprobe));
-            break;
-          default:
-            DC_LOG_ERROR("Unknown probe type encountered in extractProbes()");
+static bool split_uprobe_target(const std::string& symbol_with_offset, std::string* symbol_name,
+                                unsigned long* offset) {
+  const auto pos = symbol_with_offset.rfind(':');
+  if (pos == std::string::npos) {
+    return false;
+  }
+  *symbol_name = symbol_with_offset.substr(0, pos);
+  *offset = std::stoul(symbol_with_offset.substr(pos + 1), nullptr, 0);
+  return true;
+}
+
+static std::string normalize_syscall_name_for_attach(const std::string& function_name) {
+  if (function_name.rfind("__x64_sys_", 0) == 0) {
+    return function_name.substr(10);
+  }
+  if (function_name.rfind("sys_", 0) == 0) {
+    return function_name.substr(4);
+  }
+  return function_name;
+}
+
+static unsigned int runtime_probe_kind(datacrumbs::ProbeType probe_type) {
+  switch (probe_type) {
+    case datacrumbs::ProbeType::KPROBE:
+      return DATACRUMBS_RUNTIME_PROBE_KIND_KPROBE;
+    case datacrumbs::ProbeType::UPROBE:
+      return DATACRUMBS_RUNTIME_PROBE_KIND_UPROBE;
+    case datacrumbs::ProbeType::SYSCALLS:
+      return DATACRUMBS_RUNTIME_PROBE_KIND_SYSCALL;
+    case datacrumbs::ProbeType::USDT:
+      return DATACRUMBS_RUNTIME_PROBE_KIND_USDT;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * @brief Translate a configured new-PID source name into its BPF source id.
+ *
+ * Which calls create processes is declared in the user configuration, validated
+ * by the probe manager, and carried in the signed probe descriptor, so this is
+ * only the string-to-id mapping for the sources BPF knows how to read. Adding a
+ * source means adding a name here and a matching case in track_new_pid().
+ *
+ * @param source_name Source declared for the function. Example: "return".
+ * @return A DATACRUMBS_NEW_PID_SOURCE_* value; NONE when unset or unrecognised.
+ */
+static unsigned int new_pid_source_id(const std::string& source_name) {
+  if (source_name.empty()) {
+    return DATACRUMBS_NEW_PID_SOURCE_NONE;
+  }
+  if (source_name == "return") {
+    return DATACRUMBS_NEW_PID_SOURCE_RETURN;
+  }
+  DC_LOG_WARN("Unknown new-pid source '%s'; processes created here will not be traced",
+              source_name.c_str());
+  return DATACRUMBS_NEW_PID_SOURCE_NONE;
+}
+
+static int populate_event_arg_config(
+    int map_fd, uint64_t cookie, uint64_t event_id, datacrumbs::ProbeType probe_type,
+    const std::string& function_name, const std::string& new_pid_source,
+    const std::vector<datacrumbs::ProbeArgCaptureSpec>* arg_specs) {
+  // Populate one compact per-event capture schema consumed directly by BPF programs.
+  runtime_event_config_t config = {};
+  config.event_id = event_id;
+  config.probe_kind = runtime_probe_kind(probe_type);
+  config.new_pid_source = new_pid_source_id(new_pid_source);
+  if (config.new_pid_source != DATACRUMBS_NEW_PID_SOURCE_NONE) {
+    DC_LOG_DEBUG("Probe '%s' declared as creating processes via '%s'; children will be traced",
+                 function_name.c_str(), new_pid_source.c_str());
+  }
+  if (arg_specs != nullptr) {
+    config.arg_count = std::min<unsigned int>(arg_specs->size(), DATACRUMBS_MAX_CAPTURE_ARGS);
+    for (unsigned int index = 0; index < config.arg_count; ++index) {
+      const auto& spec = (*arg_specs)[index];
+      config.arg_index[index] = (*arg_specs)[index].index;
+      if (spec.is_pointer) {
+        if (is_char_pointer_type(spec.c_type)) {
+          config.arg_num_bytes[index] =
+              std::min<unsigned int>(spec.num_bytes, DATACRUMBS_MAX_CAPTURE_BYTES);
+          config.arg_is_pointer[index] = 1;
+        } else {
+          config.arg_num_bytes[index] = 0;
+          config.arg_is_pointer[index] = 0;
         }
-        for (const auto& func : manual_probe->functions) {
-          total_manual_probes += 2;
-          if (probe.type == datacrumbs::ProbeType::UPROBE) {
-            auto uprobe = std::dynamic_pointer_cast<datacrumbs::UProbe>(manual_probe);
-            uint64_t func_hash = std::stoull(func, nullptr, 0);
-            auto func_name_ = config_manager->category_map[func_hash].second;
-            DC_LOG_DEBUG("Extracted function name: %s", func_name_.c_str());
-            auto pos = func_name_.find(':');
-            std::string offset = "";
-            bool is_manual = false;
-            if (pos != std::string::npos) {
-              offset = func_name_.substr(pos + 1);
-              func_name_ = func_name_.substr(0, pos);
-              is_manual = true;
-            } else {
-              offset = "";
-            }
-            if (is_manual) {
-              std::string sanitized_func_name = func_name_;
-              if (sanitized_func_name.length() > 10) {
-                sanitized_func_name = sanitized_func_name.substr(0, 10);
-              }
-              std::replace(sanitized_func_name.begin(), sanitized_func_name.end(), '.', '_');
-              std::replace(sanitized_func_name.begin(), sanitized_func_name.end(), '@', '_');
-              sanitized_func_name += func;
-              auto entry_func = sanitized_func_name + "_entry";
-              auto exit_func = sanitized_func_name + "_exit";
-              struct bpf_link* link;
-              struct bpf_program* prog =
-                  bpf_object__find_program_by_name(skel->obj, entry_func.c_str());
-              struct bpf_uprobe_opts opts = {
-                  .sz = sizeof(struct bpf_uprobe_opts),
-              };
-
-              // Convert offset string to hex value if present
-              unsigned long offset_val = 0;
-              if (offset != "" && prog != NULL) {
-                offset_val =
-                    std::stoul(offset.c_str(), nullptr, 0);  // Accepts hex ("0x...") or decimal
-                DC_LOG_DEBUG("Attaching program %s to %s at offset:0x%lx manually",
-                             entry_func.c_str(), uprobe->binary_path.c_str(), offset_val);
-                link = bpf_program__attach_uprobe_opts(
-                    prog, -1 /* not a retprobe */, uprobe->binary_path.c_str(), offset_val, &opts);
-
-                if (link == NULL) {
-                  // This will provide a more specific error code than the skeleton attach.
-                  DC_LOG_DEBUG("Failed to attach uprobe %s on offset:0x%lx manually: %d",
-                               func_name_.c_str(), offset_val, errno);
-                  total_failed_probes += 2;
-                } else {
-                  total_successful_probes++;
-                  // Successfully attached uprobe
-                  DC_LOG_DEBUG("Successfully attached uprobe %s on offset:0x%lx manually",
-                               func_name_.c_str(), offset_val);
-                  opts.retprobe = true;
-                  struct bpf_program* prog2 =
-                      bpf_object__find_program_by_name(skel->obj, exit_func.c_str());
-                  link = bpf_program__attach_uprobe_opts(prog2, -1 /* not a retprobe */,
-                                                         uprobe->binary_path.c_str(), offset_val,
-                                                         &opts);
-
-                  if (link == NULL) {
-                    // This will provide a more specific error code than the skeleton attach.
-                    DC_LOG_DEBUG("Failed to attach uretprobe %s on offset:0x%lx manually: %d",
-                                 func_name_.c_str(), offset_val, errno);
-                    total_failed_probes++;
-                  } else {
-                    // Successfully attached uretprobe
-                    DC_LOG_DEBUG("Successfully attached probe %s on offset:0x%lx manually",
-                                 func_name_.c_str(), offset_val);
-                    total_successful_probes++;
-                  }
-                }
-              } else {
-                DC_LOG_DEBUG("Failed to attach uprobe %s on offset:0x%lx manually: %d",
-                             func_name_.c_str(), offset_val, errno);
-                total_failed_probes += 2;
-              }
-            } else {
-              DC_LOG_DEBUG("Failed to attach uprobe %s as no offset present", func_name_.c_str());
-              total_failed_probes += 2;
-            }
-          } else {
-            DC_LOG_DEBUG("Failed to attach as only support uprobe");
-            total_failed_probes += 2;
-          }
-        }
+      } else {
+        config.arg_num_bytes[index] = std::min<unsigned int>(spec.num_bytes, 8U);
+        config.arg_is_pointer[index] = 0;
       }
     }
-    DC_LOG_INFO(
-        "Manual probes summary: total_manual_probes=%d, total_successful_probes=%d, "
-        "total_failed_probes=%d",
-        total_manual_probes, total_successful_probes, total_failed_probes);
-  } else {
-    DC_LOG_WARN("Failed to read probes file: %s", config_manager->manual_probe_path.c_str());
+  }
+  if (bpf_map_update_elem(map_fd, &cookie, &config, BPF_ANY) < 0) {
+    DC_LOG_ERROR("Failed to populate event_arg_config_map for cookie=%llu event_id=%llu", cookie,
+                 event_id);
+    return -1;
   }
   return 0;
 }
 
-static int sync_pipe[2];
+static int attach_runtime_probes(datacrumbs::EventProcessor* event_processor,
+                                 struct datacrumbs_bpf* skel) {
+  // Resolve all generic attach programs and shared config map before per-probe loop.
+  auto config_manager = event_processor->configManager_;
+  auto* client_start = bpf_object__find_program_by_name(skel->obj, "trace_client_start");
+  auto* client_stop = bpf_object__find_program_by_name(skel->obj, "trace_client_stop");
+  auto* kprobe_entry = bpf_object__find_program_by_name(skel->obj, "trace_generic_kprobe_entry");
+  auto* kprobe_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_kprobe_exit");
+  auto* syscall_entry = bpf_object__find_program_by_name(skel->obj, "trace_generic_syscall_entry");
+  auto* syscall_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_syscall_exit");
+  auto* uprobe_entry = bpf_object__find_program_by_name(skel->obj, "trace_generic_uprobe_entry");
+  auto* uprobe_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_uprobe_exit");
+  auto* usdt_entry = bpf_object__find_program_by_name(skel->obj, "trace_generic_usdt_entry");
+  auto* usdt_exit = bpf_object__find_program_by_name(skel->obj, "trace_generic_usdt_exit");
+  const int event_arg_config_fd = bpf_map__fd(skel->maps.event_arg_config_map);
 
-/**
- * @brief Sends a signal to the parent process via a pipe to indicate completion.
- *
- * This function should be called by the child process after it has performed
- * its necessary startup and initialization tasks.
- */
-static void daemon_notify_parent() {
-  char signal_byte = '!';
-  // The child process only needs the write end of the pipe.
-  // The read end has already been closed.
-  if (write(sync_pipe[1], &signal_byte, 1) == -1) {
-    // If write fails, it's likely the parent has already exited, which is fine.
-    if (errno != EPIPE) {
-      perror("write error in daemon_notify_parent");
-    }
-  }
-  // Always close the write end of the pipe after use.
-  close(sync_pipe[1]);
-}
-
-/**
- * @brief Daemonizes the process, creating a new child and waiting for a signal.
- *
- * The initial parent process forks, and the child process continues the
- * daemonization sequence. The parent blocks until the child signals success,
- * then exits.
- *
- * @return Returns 0 in the daemon process, or a positive value representing
- *         the daemon's PID in the original parent process. Returns -1 on failure.
- */
-static pid_t daemonize() {
-  pid_t pid;
-
-  // Create the pipe for synchronization before the first fork.
-  if (pipe(sync_pipe) == -1) {
-    perror("pipe error");
-    return -1;
+  if (event_arg_config_fd < 0) {
+    DC_LOG_ERROR("Failed to get event_arg_config_map fd: %d", event_arg_config_fd);
+    return 1;
   }
 
-  // First fork to detach from the controlling terminal.
-  pid = fork();
-  if (pid < 0) {
-    perror("fork error");
-    close(sync_pipe[0]);
-    close(sync_pipe[1]);
-    return -1;
+  if (!kprobe_entry || !kprobe_exit) {
+    DC_LOG_ERROR("Failed to find generic kprobe BPF programs");
+    return 1;
+  }
+  if (!syscall_entry || !syscall_exit) {
+    DC_LOG_ERROR("Failed to find generic syscall BPF programs");
+    return 1;
+  }
+  if (!uprobe_entry || !uprobe_exit) {
+    DC_LOG_ERROR("Failed to find generic uprobe BPF programs");
+    return 1;
+  }
+  if (!usdt_entry || !usdt_exit) {
+    DC_LOG_ERROR("Failed to find generic usdt BPF programs");
+    return 1;
+  }
+  if (!client_start || !client_stop) {
+    DC_LOG_ERROR("Failed to find client init BPF programs");
+    return 1;
   }
 
-  // Parent process (the original caller).
-  if (pid > 0) {
-    // Parent closes the write end of the pipe.
-    close(sync_pipe[1]);
-
-    char signal_byte;
-    // Wait to read a byte from the pipe. This blocks until the child writes.
-    if (read(sync_pipe[0], &signal_byte, 1) == -1) {
-      perror("read error in parent");
-      close(sync_pipe[0]);
-      return -1;
-    }
-
-    // Child signaled success. Parent can now exit cleanly.
-    close(sync_pipe[0]);
-    exit(EXIT_SUCCESS);
-  }
-
-  // First child process.
-  // Close the read end of the pipe, as the child will only write.
-  close(sync_pipe[0]);
-
-  // Become a session leader to detach from the controlling terminal.
-  if (setsid() < 0) {
-    perror("setsid error");
-    exit(EXIT_FAILURE);
-  }
-
-  // Second fork to ensure the daemon can't reacquire a controlling terminal.
-  signal(SIGHUP, SIG_IGN);
-  pid = fork();
-  if (pid < 0) {
-    perror("fork error");
-    exit(EXIT_FAILURE);
-  }
-
-  // First child exits, orphaning the second child.
-  if (pid > 0) {
-    // The first child exits, leaving the second child as the daemon.
-    exit(EXIT_SUCCESS);
-  }
-
-  // This code runs only in the second child (the actual daemon).
-
-  // Close all open file descriptors.
-  int x;
-  for (x = sysconf(_SC_OPEN_MAX); x >= 0; x--) {
-    if (x != sync_pipe[1]) {  // Keep the write end of the pipe open for the signal
-      close(x);
+  {
+    // Always hook datacrumbs client lifecycle entry/exit points.
+    struct bpf_uprobe_opts start_opts = {};
+    start_opts.sz = sizeof(start_opts);
+    start_opts.func_name = "datacrumbs_start";
+    struct bpf_uprobe_opts stop_opts = {};
+    stop_opts.sz = sizeof(stop_opts);
+    stop_opts.func_name = "datacrumbs_stop";
+    auto* start_link =
+        bpf_program__attach_uprobe_opts(client_start, -1, DATACRUMBS_CLIENT_LIB, 0, &start_opts);
+    auto* stop_link =
+        bpf_program__attach_uprobe_opts(client_stop, -1, DATACRUMBS_CLIENT_LIB, 0, &stop_opts);
+    if (libbpf_get_error(start_link) || libbpf_get_error(stop_link)) {
+      DC_LOG_ERROR("Failed to attach datacrumbs client hooks for %s", DATACRUMBS_CLIENT_LIB);
+      return 1;
     }
   }
 
-  // Reopen standard file descriptors to /dev/null.
-  open("/dev/null", O_RDWR);  // stdin
-  dup(0);                     // stdout
-  dup(0);                     // stderr
+  int total_requested = 0;
+  int total_attached = 0;
+  int total_failed = 0;
+  uint64_t cookie = 1;
+  bool runtime_probe_state_updated = false;
 
-  return 0;  // Return 0 in the daemon process.
-}
+  for (const auto& probe : config_manager->runtime_probes) {
+    for (const auto& function_name : probe->functions) {
+      // Resolve generated runtime event id first; attachment is skipped when mapping is missing.
+      const auto event_id = config_manager->get_runtime_event_id(probe->name, function_name);
+      if (!event_id.has_value()) {
+        DC_LOG_WARN("Skipping runtime probe without generated event id: %s.%s", probe->name.c_str(),
+                    function_name.c_str());
+        total_failed += 2;
+        continue;
+      }
 
-static std::string get_hostname() {
-  char hostname[HOST_NAME_MAX];
-  if (gethostname(hostname, sizeof(hostname)) == 0) {
-    return std::string(hostname);
+      const uint64_t current_cookie = cookie++;
+      if (probe->type == datacrumbs::ProbeType::KPROBE) {
+        // Attach entry+exit kprobes and track runtime state success/failure.
+        total_requested += 2;
+        if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      function_name, probe->getNewPidSource(function_name),
+                                      probe->getArgSpecs(function_name)) != 0) {
+          total_failed += 2;
+          continue;
+        }
+        struct bpf_kprobe_opts entry_opts = {};
+        entry_opts.sz = sizeof(entry_opts);
+        entry_opts.bpf_cookie = current_cookie;
+        struct bpf_kprobe_opts exit_opts = {};
+        exit_opts.sz = sizeof(exit_opts);
+        exit_opts.retprobe = true;
+        exit_opts.bpf_cookie = current_cookie;
+        auto* entry_link =
+            bpf_program__attach_kprobe_opts(kprobe_entry, function_name.c_str(), &entry_opts);
+        auto* exit_link =
+            bpf_program__attach_kprobe_opts(kprobe_exit, function_name.c_str(), &exit_opts);
+        if (libbpf_get_error(entry_link) || libbpf_get_error(exit_link)) {
+          config_manager->record_invalid_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_failed += 2;
+          continue;
+        }
+        config_manager->record_successful_runtime_probe(probe, function_name);
+        runtime_probe_state_updated = true;
+        total_attached += 2;
+      } else if (probe->type == datacrumbs::ProbeType::SYSCALLS) {
+        // Normalize syscall names to avoid double-prefix attach failures.
+        total_requested += 2;
+        const std::string syscall_name = normalize_syscall_name_for_attach(function_name);
+        if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      function_name, probe->getNewPidSource(function_name),
+                                      probe->getArgSpecs(function_name)) != 0) {
+          total_failed += 2;
+          continue;
+        }
+        struct bpf_ksyscall_opts entry_opts = {};
+        entry_opts.sz = sizeof(entry_opts);
+        entry_opts.bpf_cookie = current_cookie;
+        struct bpf_ksyscall_opts exit_opts = {};
+        exit_opts.sz = sizeof(exit_opts);
+        exit_opts.retprobe = true;
+        exit_opts.bpf_cookie = current_cookie;
+        auto* entry_link =
+            bpf_program__attach_ksyscall(syscall_entry, syscall_name.c_str(), &entry_opts);
+        auto* exit_link =
+            bpf_program__attach_ksyscall(syscall_exit, syscall_name.c_str(), &exit_opts);
+        if (libbpf_get_error(entry_link) || libbpf_get_error(exit_link)) {
+          config_manager->record_invalid_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_failed += 2;
+          continue;
+        }
+        config_manager->record_successful_runtime_probe(probe, function_name);
+        runtime_probe_state_updated = true;
+        total_attached += 2;
+      } else if (probe->type == datacrumbs::ProbeType::UPROBE) {
+        // Attach uprobes by symbol or resolved offset target.
+        total_requested += 2;
+        auto uprobe = std::dynamic_pointer_cast<datacrumbs::UProbe>(probe);
+        std::string symbol_name;
+        unsigned long offset = 0;
+        const bool has_offset = uprobe && split_uprobe_target(function_name, &symbol_name, &offset);
+        if (!uprobe) {
+          DC_LOG_WARN("Skipping invalid uprobe config for %s.%s", probe->name.c_str(),
+                      function_name.c_str());
+          total_failed += 2;
+          continue;
+        }
+        if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      function_name, probe->getNewPidSource(function_name),
+                                      probe->getArgSpecs(function_name)) != 0) {
+          total_failed += 2;
+          continue;
+        }
+        struct bpf_uprobe_opts entry_opts = {};
+        entry_opts.sz = sizeof(entry_opts);
+        entry_opts.bpf_cookie = current_cookie;
+        struct bpf_uprobe_opts exit_opts = {};
+        exit_opts.sz = sizeof(exit_opts);
+        exit_opts.retprobe = true;
+        exit_opts.bpf_cookie = current_cookie;
+        if (!has_offset) {
+          entry_opts.func_name = function_name.c_str();
+          exit_opts.func_name = function_name.c_str();
+        }
+        auto* entry_link = bpf_program__attach_uprobe_opts(
+            uprobe_entry, -1, uprobe->binary_path.c_str(), offset, &entry_opts);
+        auto* exit_link = bpf_program__attach_uprobe_opts(
+            uprobe_exit, -1, uprobe->binary_path.c_str(), offset, &exit_opts);
+        if (libbpf_get_error(entry_link) || libbpf_get_error(exit_link)) {
+          config_manager->record_invalid_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_failed += 2;
+          continue;
+        }
+        config_manager->record_successful_runtime_probe(probe, function_name);
+        runtime_probe_state_updated = true;
+        total_attached += 2;
+      } else if (probe->type == datacrumbs::ProbeType::USDT) {
+        // Attach USDT entry/exit probes against configured provider/function.
+        total_requested += 2;
+        auto usdt = std::dynamic_pointer_cast<datacrumbs::USDTProbe>(probe);
+        if (populate_event_arg_config(event_arg_config_fd, current_cookie, *event_id, probe->type,
+                                      function_name, probe->getNewPidSource(function_name),
+                                      probe->getArgSpecs(function_name)) != 0) {
+          total_failed += 2;
+          continue;
+        }
+        struct bpf_usdt_opts entry_opts = {};
+        entry_opts.sz = sizeof(entry_opts);
+        entry_opts.usdt_cookie = current_cookie;
+        struct bpf_usdt_opts exit_opts = {};
+        exit_opts.sz = sizeof(exit_opts);
+        exit_opts.usdt_cookie = current_cookie;
+        auto* entry_link = usdt ? bpf_program__attach_usdt(
+                                      usdt_entry, -1, usdt->binary_path.c_str(),
+                                      usdt->provider.c_str(), function_name.c_str(), &entry_opts)
+                                : nullptr;
+        auto* exit_link = usdt ? bpf_program__attach_usdt(usdt_exit, -1, usdt->binary_path.c_str(),
+                                                          usdt->provider.c_str(),
+                                                          function_name.c_str(), &exit_opts)
+                               : nullptr;
+        if (!usdt || libbpf_get_error(entry_link) || libbpf_get_error(exit_link)) {
+          config_manager->record_invalid_runtime_probe(probe, function_name);
+          runtime_probe_state_updated = true;
+          total_failed += 2;
+          continue;
+        }
+        config_manager->record_successful_runtime_probe(probe, function_name);
+        runtime_probe_state_updated = true;
+        total_attached += 2;
+      } else {
+        DC_LOG_WARN("Skipping unsupported runtime probe type %d for %s",
+                    static_cast<int>(probe->type), probe->name.c_str());
+        total_failed += 2;
+      }
+    }
   }
-  struct utsname uts;
-  if (uname(&uts) == 0) {
-    return std::string(uts.nodename);
+
+  if (runtime_probe_state_updated) {
+    // Persist latest success/failure status for runtime diagnostics/reporting.
+    config_manager->persist_runtime_probe_state();
   }
-  return "unknownhost";
+
+  DC_LOG_INFO("Runtime probe attachment summary: requested=%d attached=%d failed=%d",
+              total_requested, total_attached, total_failed);
+  return 0;
 }
 
-static std::string get_timestamp() {
-  time_t now = time(nullptr);
-  char buf[32];
-  strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&now));
-  return std::string(buf);
-}
-
-static void redirect_output(const std::string& logfile, const std::string& user) {
-  FILE* logf = freopen(logfile.c_str(), "a+", stdout);
-  if (!logf) {
-    perror("freopen failed to open log file");
-    exit(EXIT_FAILURE);
-  }
-  freopen(logfile.c_str(), "a+", stderr);
-  auto pwd = getpwnam(user.c_str());
-  uid_t uid = pwd ? pwd->pw_uid : static_cast<uid_t>(-1);
-  gid_t gid = pwd ? pwd->pw_gid : static_cast<gid_t>(-1);
-  // Set file ownership to user
-  chown(logfile.c_str(), uid, gid);
-  // Optionally set permissions (e.g., rw-r-----)
-  chmod(logfile.c_str(), 0640);
-}
-
-static void write_pid_file(const std::string& pidfile, const std::string& user) {
-  if (access(pidfile.c_str(), F_OK) == 0) {
-    remove(pidfile.c_str());
-  }
-  std::ofstream ofs(pidfile);
-  ofs << getpid() << std::endl;
-  ofs.close();
-  auto pwd = getpwnam(user.c_str());
-  uid_t uid = pwd ? pwd->pw_uid : static_cast<uid_t>(-1);
-  gid_t gid = pwd ? pwd->pw_gid : static_cast<gid_t>(-1);
-  // Set file ownership to user
-  chown(pidfile.c_str(), uid, gid);
-  // Optionally set permissions (e.g., rw-r-----)
-  chmod(pidfile.c_str(), 0640);
-}
-
-static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event_processor,
-                        bool notify_parent = false) {
+static int main_process(datacrumbs::EventProcessor* event_processor) {
   DC_LOG_TRACE("main: start");
   datacrumbs::utils::Timer timer;
   timer.resumeTime();
 
-  struct datacrumbs_bpf* skel;
-  int err;
-  struct ring_buffer* rb = NULL;
+  struct datacrumbs_bpf* skel = nullptr;
+  struct ring_buffer* rb = nullptr;
+  int err = 0;
   libbpf_set_print(libbpf_print_fn);
 
-  // Open and load BPF skeleton
   skel = datacrumbs_bpf__open_and_load();
   if (!skel) {
     DC_LOG_ERROR("Failed to open BPF object");
     return 1;
   }
 
-  // Attach BPF skeleton
   err = datacrumbs_bpf__attach(skel);
   if (err) {
     DC_LOG_ERROR("Failed to attach BPF skeleton: %d", err);
     datacrumbs_bpf__destroy(skel);
     return 1;
   }
-  manual_probes(event_processor, skel);
+  err = attach_runtime_probes(event_processor, skel);
+  if (err) {
+    DC_LOG_ERROR("Failed to attach runtime probes: %d", err);
+    datacrumbs_bpf__destroy(skel);
+    return 1;
+  }
+
 #if !(defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1))
-  DC_LOG_WARN("DATACRUMBS_ENABLE_OPT is set to OFF. Nothing will be captured");
+  DC_LOG_WARN("DATACRUMBS_ENABLE_OPT is OFF. Nothing will be captured");
 #endif
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   DC_LOG_PRINT("DataCrumbs in Tracer mode");
@@ -403,9 +435,9 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
     datacrumbs_bpf__destroy(skel);
     return 1;
   }
-  struct string_t* cur_key = NULL;
+  struct string_t* cur_key = nullptr;
   struct string_t next_key = {};
-  struct string_t value;
+  struct string_t value = {};
   for (;;) {
     err = bpf_map_get_next_key(inclusion_trie, cur_key, &next_key);
     if (err) break;
@@ -413,16 +445,15 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
     cur_key = &next_key;
   }
 
-  // Get inclusion_path from configuration manager and build inclusion_list
   std::unordered_map<unsigned int, string_t> inclusion_list;
-  std::string inclusion_paths = event_processor->configManager_->inclusion_paths;
+  const std::string inclusion_paths = event_processor->configManager_->inclusion_paths;
   if (!inclusion_paths.empty()) {
     std::stringstream ss(inclusion_paths);
     std::string path;
     unsigned int idx = 1;
     while (std::getline(ss, path, ':')) {
       if (!path.empty()) {
-        string_t s;
+        string_t s = {};
         size_t copy_len = path.size();
         if (copy_len > sizeof(s.str) - 1) copy_len = sizeof(s.str) - 1;
         strncpy(s.str, path.c_str(), copy_len);
@@ -438,22 +469,18 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
       datacrumbs_bpf__destroy(skel);
       return 1;
     }
-    DC_LOG_DEBUG("Added inclusion path: %s", path.c_str());
   }
-  cur_key = NULL;
+  cur_key = nullptr;
   next_key = {};
   for (;;) {
     err = bpf_map_get_next_key(inclusion_trie, cur_key, &next_key);
     if (err) break;
-
     bpf_map_lookup_elem(inclusion_trie, &next_key, &value);
-
-    /* Use key and value here */
-    DC_LOG_INFO("Trie key: %s, len: %u, value: %u", next_key.str, next_key.len, value);
-
+    DC_LOG_INFO("Trie key: %s, len: %u, value_len: %u", next_key.str, next_key.len, value.len);
     cur_key = &next_key;
   }
 #endif
+
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   int failed_events_fd = bpf_map__fd(skel->maps.failed_request);
   if (failed_events_fd < 0) {
@@ -461,11 +488,8 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
     datacrumbs_bpf__destroy(skel);
     return 1;
   }
-  // Prepare context for event handler
-  // Create ring buffer for event processing
-  rb = ring_buffer__new(bpf_map__fd(skel->maps.output), handle_event, event_processor, NULL);
+  rb = ring_buffer__new(bpf_map__fd(skel->maps.output), handle_event, event_processor, nullptr);
   if (!rb) {
-    err = -1;
     DC_LOG_ERROR("Failed to create ring buffer");
     datacrumbs_bpf__destroy(skel);
     return 1;
@@ -503,56 +527,37 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
     return 1;
   }
 #endif
+
   int file_hash_fd = bpf_map__fd(skel->maps.file_map);
   if (file_hash_fd < 0) {
     DC_LOG_ERROR("Failed to get file hash fd: %d", file_hash_fd);
     datacrumbs_bpf__destroy(skel);
     return 1;
   }
-  double elapsed = timer.pauseTime();
 
-  if (event_processor->configManager_->mpi_rank == 0) {
-    DC_LOG_PRINT("Initialization of DataCrumbs elapsed time: %f seconds", elapsed);
+  const double elapsed = timer.pauseTime();
+  DC_LOG_PRINT("Initialization of DataCrumbs elapsed time: %f seconds", elapsed);
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(
+        event_processor->configManager_->server_ready_file.parent_path(), ec);
+    std::ofstream ready_output(event_processor->configManager_->server_ready_file);
+    if (ready_output.is_open()) {
+      ready_output << "ready\n";
+    }
   }
+  DC_LOG_INFO("DataCrumbs ready to run for user:%s run_id:%s trace_file:%s",
+              event_processor->configManager_->user.c_str(),
+              event_processor->configManager_->run_id.c_str(),
+              event_processor->configManager_->trace_file_path.c_str());
 
-  if (notify_parent) daemon_notify_parent();
-  // Main event polling loop
   signal(SIGINT, sig_handler);
-  if (event_processor->configManager_->mpi_rank == 0) {
-    std::string ready_file;
-    const char* env_ready_file = getenv("DATACRUMBS_SERVER_READY_FILE");
-    if (env_ready_file) {
-      ready_file = std::string(env_ready_file);
-    } else {
-      ready_file = std::string(DATACRUMBS_INSTALL_RUNSTATEDIR) + "/datacrumbs-" +
-                   event_processor->configManager_->run_id + ".ready";
-    }
-    std::ofstream ofs_ready(ready_file);
-    ofs_ready << "ready" << std::endl;
-    ofs_ready.close();
-    if (ready_file.substr(0, 4) != "/run" && ready_file.substr(0, 8) != "/var/run") {
-      auto pwd = getpwnam(event_processor->configManager_->user.c_str());
-      auto uid = pwd ? pwd->pw_uid : static_cast<uid_t>(-1);
-      auto gid = pwd ? pwd->pw_gid : static_cast<gid_t>(-1);
-      chown(ready_file.c_str(), uid, gid);
-      chmod(ready_file.c_str(), 0660);
-    }
-    DC_LOG_INFO("Ready file created: %s for user:%s on %d nodes", ready_file.c_str(),
-                event_processor->configManager_->user.c_str(),
-                event_processor->configManager_->mpi_size);
-    DC_LOG_PRINT("Server running on %d nodes. Ready to run the code.",
-                 event_processor->configManager_->mpi_size);
-  }
-  if (!event_processor->configManager_->disable_mpi) {
-    MPI_Barrier(MPI_COMM_WORLD);
-  }
   unsigned int batch_size = 1024;
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 0)
-
-  struct string_t* keys = (struct string_t*)malloc(batch_size * sizeof(struct string_t));
-  unsigned int* values = (unsigned int*)malloc(batch_size * sizeof(unsigned int));
-  // Initialize in_batch to NULL for the first iteration
-  struct string_t* in_batch = NULL;
+  struct string_t* keys =
+      static_cast<struct string_t*>(malloc(batch_size * sizeof(struct string_t)));
+  unsigned int* values = static_cast<unsigned int*>(malloc(batch_size * sizeof(unsigned int)));
+  struct string_t* in_batch = nullptr;
 #endif
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 2)
@@ -584,18 +589,16 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
 #endif
 
   unsigned long long last_processed_timestamp = 0;
-  auto time_unit = 1000000000 / DATACRUMBS_TIME_INTERVAL_NS;
   while (!stop) {
     err = 0;
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 0)
     err = lookup_and_delete(file_hash_fd, event_processor, keys, values, batch_size, in_batch);
     if (err == -EINTR) {
-      DC_LOG_INFO("\nReceived EINTR, exiting poll loop");
       err = 0;
       break;
     }
 #endif
-    err = 0;
+
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
     int failed_events = 0;
     err = bpf_map_lookup_elem(failed_events_fd, &DATACRUMBS_FAILED_EVENTS_KEY, &failed_events);
@@ -603,9 +606,7 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
       event_processor->failed_events = failed_events;
     }
     err = ring_buffer__poll(rb, 10);
-    // Ctrl-C gives -EINTR
     if (err == -EINTR) {
-      DC_LOG_INFO("\nReceived EINTR, exiting poll loop");
       err = 0;
       break;
     }
@@ -620,11 +621,8 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
       if (last_processed_timestamp == 0) {
         last_processed_timestamp = latest_ts;
       }
-      if (latest_ts - last_processed_timestamp > 0) {
-        DC_LOG_DEBUG("Recieved latest latest_ts:%llu, last_processed_timestamp:%llu, interval:%d",
-                     latest_ts, last_processed_timestamp, 0);
+      if (latest_ts > last_processed_timestamp) {
         last_processed_timestamp = latest_ts;
-
         LOOKUP_1_CALL();
 #ifdef GET_DATA_2_EXISTS
         LOOKUP_2_CALL();
@@ -653,26 +651,17 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
       }
     }
 #endif
-    // Ctrl-C gives -EINTR
-    if (err == -EINTR) {
-      DC_LOG_INFO("\nReceived EINTR, exiting poll loop");
-      err = 0;
-      break;
-    }
   }
+
   batch_size = 1024 * 1024;
-  DC_LOG_INFO("\n");
+  DC_LOG_INFO("");
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 2)
-  DC_LOG_INFO("Collecting rest of the events");
-  unsigned long long latest_ts = 0;
-  DC_LOG_INFO("Collecting rest general events");
+  DC_LOG_INFO("Collecting remaining profiling events");
   while (LOOKUP_1_CALL() != -1);
 #ifdef GET_DATA_2_EXISTS
-  DC_LOG_INFO("Collecting rest sysio events");
   while (LOOKUP_2_CALL() != -1);
 #endif
 #ifdef GET_DATA_3_EXISTS
-  DC_LOG_INFO("Collecting rest usdt events");
   while (LOOKUP_3_CALL() != -1);
 #endif
 #ifdef GET_DATA_4_EXISTS
@@ -694,223 +683,64 @@ static int main_process(int argc, char** argv, datacrumbs::EventProcessor* event
   while (LOOKUP_9_CALL() != -1);
 #endif
 #endif
+
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   int failed_events = 0;
   err = bpf_map_lookup_elem(failed_events_fd, &DATACRUMBS_FAILED_EVENTS_KEY, &failed_events);
-  if (err == 0 && event_processor->configManager_->mpi_rank == 0) {
+  if (err == 0) {
     DC_LOG_PRINT("Total %d events failed", failed_events);
   }
 #endif
 
 #if defined(DATACRUMBS_BPFTIME_COMPATIBLE_FLAG) && (DATACRUMBS_BPFTIME_COMPATIBLE_FLAG == 0)
-  if (event_processor->configManager_->mpi_rank == 0) {
-    DC_LOG_PRINT("Collecting string metadata from file_map...");
-  }
+  DC_LOG_PRINT("Collecting string metadata from file_map...");
   while (lookup_and_delete(file_hash_fd, event_processor, keys, values, batch_size, in_batch) ==
          1) {
-    // Continue until no more keys are found
   }
-  if (keys) {
-    free(keys);
-  }
-  if (values) {
-    free(values);
-  }
+  if (keys) free(keys);
+  if (values) free(values);
 #endif
-  if (event_processor->configManager_->mpi_rank == 0) {
-    DC_LOG_PRINT("Finalizing DataCrumbs...");
-  }
+
+  DC_LOG_PRINT("Finalizing DataCrumbs...");
   if (stop) {
     DC_LOG_INFO("Received SIGINT (Ctrl-C), exiting gracefully");
   }
-  // Measure elapsed time for finalization and cleanup
   timer.resumeTime();
-
-  // Finalize ChromeWriter instance
   event_processor->finalize();
+  {
+    std::error_code ec;
+    std::filesystem::remove(event_processor->configManager_->server_ready_file, ec);
+  }
 
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
-  // Cleanup resources
   ring_buffer__free(rb);
 #endif
   datacrumbs_bpf__destroy(skel);
 
-  double finalize_elapsed = timer.pauseTime();
-  double sum_elapsed = 0.0, min_elapsed = 0.0, max_elapsed = 0.0;
-  if (!event_processor->configManager_->disable_mpi) {
-    MPI_Reduce(&finalize_elapsed, &sum_elapsed, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&finalize_elapsed, &min_elapsed, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&finalize_elapsed, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-  } else {
-    sum_elapsed = finalize_elapsed;
-    min_elapsed = finalize_elapsed;
-    max_elapsed = finalize_elapsed;
-  }
-  if (event_processor->configManager_->mpi_rank == 0) {
-    DC_LOG_PRINT("Finalization and cleanup of DataCrumbs: average=%f, min=%f, max=%f over %d ranks",
-                 sum_elapsed / event_processor->configManager_->mpi_size, min_elapsed, max_elapsed,
-                 event_processor->configManager_->mpi_size);
-  }
-
-  // Gather failed_events and total_events across all ranks
-  int local_failed_events = event_processor->failed_events;
-  int global_failed_events_sum = 0, global_failed_events_min = 0, global_failed_events_max = 0;
-  if (!event_processor->configManager_->disable_mpi) {
-    MPI_Reduce(&local_failed_events, &global_failed_events_sum, 1, MPI_INT, MPI_SUM, 0,
-               MPI_COMM_WORLD);
-    MPI_Reduce(&local_failed_events, &global_failed_events_min, 1, MPI_INT, MPI_MIN, 0,
-               MPI_COMM_WORLD);
-    MPI_Reduce(&local_failed_events, &global_failed_events_max, 1, MPI_INT, MPI_MAX, 0,
-               MPI_COMM_WORLD);
-  } else {
-    global_failed_events_sum = local_failed_events;
-    global_failed_events_min = local_failed_events;
-    global_failed_events_max = local_failed_events;
-  }
-  int local_total_events = static_cast<int>(event_processor->event_index.load());
-  int global_total_events_sum = 0, global_total_events_min = 0, global_total_events_max = 0;
-  if (!event_processor->configManager_->disable_mpi) {
-    MPI_Reduce(&local_total_events, &global_total_events_sum, 1, MPI_INT, MPI_SUM, 0,
-               MPI_COMM_WORLD);
-    MPI_Reduce(&local_total_events, &global_total_events_min, 1, MPI_INT, MPI_MIN, 0,
-               MPI_COMM_WORLD);
-    MPI_Reduce(&local_total_events, &global_total_events_max, 1, MPI_INT, MPI_MAX, 0,
-               MPI_COMM_WORLD);
-  } else {
-    global_total_events_sum = local_total_events;
-    global_total_events_min = local_total_events;
-    global_total_events_max = local_total_events;
-  }
-  if (event_processor->configManager_->mpi_rank == 0) {
-    DC_LOG_PRINT("Failed events: sum=%d, min=%d, max=%d", global_failed_events_sum,
-                 global_failed_events_min, global_failed_events_max);
-    DC_LOG_PRINT("Total events: sum=%d, min=%d, max=%d", global_total_events_sum,
-                 global_total_events_min, global_total_events_max);
-    // Write status info to JSON file for postprocessing
-    std::string status_file;
-    const char* env_statusfile = getenv("DATACRUMBS_SERVER_STATUS_FILE");
-    if (env_statusfile) {
-      status_file = std::string(env_statusfile);
-    } else {
-      status_file = std::string(DATACRUMBS_INSTALL_RUNSTATEDIR) + "/datacrumbs-" +
-                    event_processor->configManager_->run_id + ".json";
-    }
-    struct json_object* status_json = json_object_new_object();
-    json_object_object_add(
-        status_json, "trace_file",
-        json_object_new_string(event_processor->configManager_->trace_file_path.c_str()));
-    json_object_object_add(status_json, "total_events_captured",
-                           json_object_new_int64(event_processor->event_index.load()));
-    json_object_object_add(status_json, "events_failed",
-                           json_object_new_int(event_processor->failed_events));
-
-    if (json_object_to_file_ext(status_file.c_str(), status_json, JSON_C_TO_STRING_PRETTY) != 0) {
-      DC_LOG_ERROR("Failed to write status file: %s", status_file.c_str());
-    }
-    json_object_put(status_json);
-    if (status_file.substr(0, 4) != "/run" && status_file.substr(0, 8) != "/var/run") {
-      auto pwd = getpwnam(event_processor->configManager_->user.c_str());
-      auto uid = pwd ? pwd->pw_uid : static_cast<uid_t>(-1);
-      auto gid = pwd ? pwd->pw_gid : static_cast<gid_t>(-1);
-      chown(status_file.c_str(), uid, gid);
-      chmod(status_file.c_str(), 0660);
-    }
-  }
-
+  const double finalize_elapsed = timer.pauseTime();
+  DC_LOG_PRINT("Finalization and cleanup of DataCrumbs elapsed: %f seconds", finalize_elapsed);
+  DC_LOG_PRINT("Failed events: %d", event_processor->failed_events);
+  DC_LOG_PRINT("Total events: %llu", event_processor->event_index.load());
   DC_LOG_TRACE("main: end");
   return 0;
 }
 
 static int main_call(int argc, char** argv) {
-  auto event_processor = datacrumbs::EventProcessor(argc, argv);
-  if (!event_processor.configManager_->disable_mpi) {
-    MPI_Init(&argc, &argv);
-    event_processor.configManager_->load_mpi_configurations();
+  if (argc < 4) {
+    DC_LOG_ERROR("Usage: %s <signed-probes.json.gz> <run-id> <user>", argv[0]);
+    return 1;
   }
 
-  std::string pidfile;
-  const char* env_pidfile = getenv("DATACRUMBS_SERVER_PID_FILE");
-  if (env_pidfile) {
-    pidfile = std::string(env_pidfile);
-  } else {
-    pidfile = std::string(DATACRUMBS_INSTALL_RUNSTATEDIR) + "/datacrumbs-" +
-              event_processor.configManager_->run_id + ".pid";
+  const std::string run_id = argv[2];
+  const std::string user = argv[3];
+  auto config_manager =
+      datacrumbs::Singleton<datacrumbs::RuntimeConfigurationManager>::get_instance(argv[1], run_id,
+                                                                                   user, true);
+  if (!config_manager) {
+    DC_LOG_ERROR("Failed to initialize runtime configuration manager");
+    return 1;
   }
-
-  int return_code = 0;
-  if (event_processor.configManager_->mpi_rank == 0 &&
-      event_processor.configManager_->exe_mode != datacrumbs::ExecutableMode::STOP) {
-    event_processor.configManager_->print_configurations();
-  }
-  if (event_processor.configManager_->exe_mode == datacrumbs::ExecutableMode::RUN) {
-    write_pid_file(pidfile, event_processor.configManager_->user);
-    return_code = main_process(argc, argv, &event_processor, false);
-  } else if (event_processor.configManager_->exe_mode == datacrumbs::ExecutableMode::START) {
-    daemonize();
-    std::string hostname = get_hostname();
-    std::string logfile = event_processor.configManager_->log_dir + "/datacrumbs_" +
-                          event_processor.configManager_->user + "_" + hostname + "_" +
-                          event_processor.configManager_->run_id + ".log";
-    redirect_output(logfile, event_processor.configManager_->user);
-    DC_LOG_PRINT("Spawned daemon with pid %d, output redirected to %s\n", getpid(),
-                 logfile.c_str());
-    write_pid_file(pidfile, event_processor.configManager_->user);
-    return_code = main_process(argc, argv, &event_processor, true);
-  } else if (event_processor.configManager_->exe_mode == datacrumbs::ExecutableMode::STOP) {
-    // Find and kill daemon by pid file
-    std::ifstream ifs(pidfile);
-    pid_t pid = 0;
-    ifs >> pid;
-    ifs.close();
-    if (pid > 0) {
-      kill(pid, SIGINT);
-      int status = 0;
-      if (pid > 0) {
-        // Wait for the process to terminate after sending SIGINT
-        // Check if process exists before calling waitpid
-        // Poll for process termination using ps
-        int max_retries = 600;  // Wait up to ~600 seconds (1s * 600)
-        const char* user = getenv("USER");
-        if (!user) {
-          user = "unknown";
-        }
-        if (event_processor.configManager_->mpi_rank == 0) {
-          DC_LOG_PRINT("Sent SIGINT as %s. Waiting for %f minutes for pid:%d to exit", user,
-                       max_retries / 60.0, pid);
-        }
-        int i;
-        for (i = 0; i < max_retries; ++i) {
-          std::string ps_cmd = "ps -p " + std::to_string(pid) + " > /dev/null";
-          int ret = system(ps_cmd.c_str());
-          if (ret != 0) {
-            // Process no longer exists
-            break;
-          }
-          usleep(1000000);  // Sleep 1s
-        }
-        if (i == max_retries) {
-          DC_LOG_PRINT("Process %d did not terminate within the expected time for rank %d.", pid,
-                       event_processor.configManager_->mpi_rank);
-          return_code = 1;
-        } else {
-          if (event_processor.configManager_->mpi_rank == 0) {
-            DC_LOG_PRINT("Process %d has terminated.", pid);
-          }
-        }
-      }
-      if (!event_processor.configManager_->disable_mpi) {
-        MPI_Barrier(MPI_COMM_WORLD);
-      }
-      if (access(pidfile.c_str(), F_OK) == 0) {
-        remove(pidfile.c_str());
-      }
-    } else {
-      DC_LOG_ERROR("Could not find pid to stop on rank %d.\n",
-                   event_processor.configManager_->mpi_rank);
-    }
-  }
-  if (!event_processor.configManager_->disable_mpi) {
-    MPI_Finalize();
-  }
-  return (return_code);
+  auto event_processor = datacrumbs::EventProcessor(argv[1]);
+  event_processor.configManager_->print_configurations();
+  return main_process(&event_processor);
 }
