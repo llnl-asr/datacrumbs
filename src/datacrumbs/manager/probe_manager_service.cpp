@@ -293,10 +293,22 @@ std::unordered_set<std::string> load_kernel_symbols() {
   if (!file.is_open()) {
     return symbols;
   }
-  std::string addr;
-  std::string type;
-  std::string name;
-  while (file >> addr >> type >> name) {
+  // Parse line by line rather than streaming tokens. Module symbols carry a
+  // fourth field ("<addr> t xfs_iunlock\t[xfs]"), and a bare `file >> a >> b >>
+  // c` leaves that "[xfs]" in the stream, so it is consumed as the next
+  // record's address and every subsequent field is shifted by one. The result
+  // is that roughly half of all module symbols silently fail to load, which
+  // shows up much later as spurious "kernel symbol not found" rejections for
+  // functions that plainly exist in /proc/kallsyms.
+  std::string line;
+  while (std::getline(file, line)) {
+    std::istringstream stream(line);
+    std::string addr;
+    std::string type;
+    std::string name;
+    if (!(stream >> addr >> type >> name)) {
+      continue;
+    }
     if (type == "T" || type == "t") {
       symbols.insert(name);
     }
