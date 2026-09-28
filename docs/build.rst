@@ -31,7 +31,7 @@ Quick Start
 
 .. code-block:: bash
 
-    git clone https://github.com/LLNL/datacrumbs.git
+    git clone https://github.com/llnl-asr/datacrumbs.git
     cd datacrumbs
 
     cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/path/to/install
